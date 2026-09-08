@@ -181,7 +181,7 @@ async function applyArtwork(element, track) {
   try { const record = await getRecord('artworkBlobs', track.artworkId); if (!record?.blob) return; let url = artworkUrls.get(track.artworkId); if (!url) { url = URL.createObjectURL(record.blob); artworkUrls.set(track.artworkId, url); } element.style.backgroundImage = `url("${url}")`; element.classList.add('has-art'); element.textContent = ''; } catch { /* fall back to local Zombie art */ }
 }
 async function mediaArtworkFor(track) {
-  const fallback = new URL('icon.svg', location.href).href;
+  const fallback = new URL('zombie-icon-512.png', location.href).href;
   if (!track?.artworkId) return fallback;
   try {
     const record = await getRecord('artworkBlobs', track.artworkId);
@@ -658,7 +658,7 @@ function wireUI() {
 async function initialise() {
   try {
     await openDatabase(); await loadLibrary(); await restorePlayerState(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#duration').textContent = formatTime(track.duration); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=12').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=13').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
