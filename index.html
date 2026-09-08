@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#11111a" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="icon.svg" />
+    <link rel="stylesheet" href="style.css" />
+    <title>My Sound Library</title>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header>
+        <p class="eyebrow">OFFLINE LIBRARY</p>
+        <div class="header-row"><h1>My Sounds</h1><button id="importButton" class="round-button" aria-label="Add audio">＋</button></div>
+        <input id="fileInput" type="file" accept="audio/*,video/*" multiple hidden />
+        <label class="search"><span>⌕</span><input id="searchInput" type="search" placeholder="Search your library" /></label>
+      </header>
+
+      <section id="dropZone" class="drop-zone">
+        <div class="drop-icon">♫</div>
+        <div><strong>Add music or recordings</strong><p>Choose files from your iPhone, or drop them here.</p></div>
+        <button id="chooseFiles" class="secondary-button">Choose files</button>
+      </section>
+
+      <section class="library-heading"><h2>Library</h2><span id="libraryCount">0 tracks</span></section>
+      <section id="trackList" class="track-list" aria-live="polite"></section>
+      <section id="emptyState" class="empty-state"><div>♪</div><h2>Your library is waiting</h2><p>Import an MP3, M4A, WAV, or a screen recording to play it here offline.</p></section>
+    </main>
+
+    <footer id="player" class="player hidden">
+      <div class="now-playing"><div class="cover small-cover">♫</div><div><strong id="nowTitle">Nothing playing</strong><span id="nowArtist">Choose a file to begin</span></div></div>
+      <div class="controls"><button id="backButton" aria-label="Go back 10 seconds">↺<small>10</small></button><button id="playButton" class="play-button" aria-label="Play">▶</button><button id="forwardButton" aria-label="Skip ahead 10 seconds">↻<small>10</small></button></div>
+      <div class="timeline"><span id="currentTime">0:00</span><input id="seekBar" type="range" min="0" max="100" value="0" aria-label="Playback position" /><span id="duration">0:00</span></div>
+      <audio id="audio"></audio>
+    </footer>
+    <div id="toast" class="toast" role="status"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
