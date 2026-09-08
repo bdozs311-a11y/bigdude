@@ -14,6 +14,9 @@ let artTarget = null;
 const artworkUrls = new Map();
 let panelTimer = null;
 let restoredPosition = 0, lastStateSaveAt = 0;
+let pendingBackup = null;
+const BACKUP_FORMAT = 'zombie-backup';
+const FULL_BACKUP_LIMIT = 40 * 1024 * 1024;
 
 const randomEmoji = () => EMOJIS[Math.floor(Math.random() * EMOJIS.length)];
 const formatTime = (seconds) => !Number.isFinite(seconds) ? '0:00' : `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
@@ -91,6 +94,68 @@ async function restorePlayerState() {
   shuffleHistory = Array.isArray(state.shuffleHistory) ? state.shuffleHistory.filter((id) => queue.includes(id)) : [];
   restoredPosition = Number.isFinite(state.position) && state.position > 0 ? state.position : 0;
   audio.volume = Number.isFinite(state.volume) ? Math.min(1, Math.max(0, state.volume)) : 1;
+}
+function cleanTrack(track) { const { blob, ...metadata } = track; return metadata; }
+function bytesToBase64(bytes) { const chunks = []; for (let offset = 0; offset < bytes.length; offset += 0x8000) chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))); return btoa(chunks.join('')); }
+function base64ToBlob(value, type = 'application/octet-stream') { const text = atob(value); const bytes = new Uint8Array(text.length); for (let index = 0; index < text.length; index += 1) bytes[index] = text.charCodeAt(index); return new Blob([bytes], { type }); }
+async function packBlob(record) { const blob = record.blob; return { id: record.id, type: blob.type || 'application/octet-stream', data: bytesToBase64(new Uint8Array(await blob.arrayBuffer())) }; }
+function downloadBackup(backup) { const blob = new Blob([JSON.stringify(backup)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = url; link.download = `zombie-${backup.kind}-backup-${new Date().toISOString().slice(0, 10)}.zombie`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
+async function exportBackup(includeAudio) {
+  try {
+    showProgress(includeAudio ? 'Building full backup' : 'Building backup', includeAudio ? 'This can take a moment for music files' : 'Saving your music details and artwork');
+    const [storedTracks, artwork, settings, blobs] = await Promise.all([readAll('tracks'), readAll('artworkBlobs'), readAll('settings'), includeAudio ? readAll('audioBlobs') : Promise.resolve([])]);
+    const rawSize = [...artwork, ...blobs].reduce((total, record) => total + (record.blob?.size || 0), 0);
+    if (includeAudio && rawSize > FULL_BACKUP_LIMIT) { toast('Full backups are limited to 40 MB. Export a metadata backup instead.'); return; }
+    const backup = { format: BACKUP_FORMAT, version: 1, kind: includeAudio ? 'full' : 'metadata', createdAt: new Date().toISOString(), tracks: storedTracks.map(cleanTrack), playlists, settings, artwork: await Promise.all(artwork.map(packBlob)), audio: includeAudio ? await Promise.all(blobs.map(packBlob)) : [] };
+    downloadBackup(backup); toast(includeAudio ? 'Full Zombie backup exported' : 'Zombie backup exported');
+  } catch { toast('Zombie could not export that backup'); } finally { hideProgress(); }
+}
+function validateBackup(value) {
+  return Boolean(value && value.format === BACKUP_FORMAT && value.version === 1 && ['metadata', 'full'].includes(value.kind) && Array.isArray(value.tracks) && Array.isArray(value.playlists) && Array.isArray(value.settings) && Array.isArray(value.artwork) && Array.isArray(value.audio));
+}
+function remapArtworkId(id, idMap) { return id?.startsWith('track:') ? `track:${idMap.get(id.slice(6)) || id.slice(6)}` : id; }
+async function chooseBackupFile(file) {
+  if (!file) return;
+  try {
+    showProgress('Checking backup', file.name);
+    if (file.size > 120 * 1024 * 1024) throw new Error('This backup is too large for a safe browser restore.');
+    const backup = JSON.parse(await file.text());
+    if (!validateBackup(backup)) throw new Error('This is not a valid Zombie backup.');
+    pendingBackup = backup; $('#sheetTitle').textContent = 'Restore Zombie backup';
+    $('#sheetContent').innerHTML = `<p class="sheet-note">${backup.kind === 'full' ? 'Full backup with audio files.' : 'Metadata backup — restores details to songs already on this iPhone.'} Choose how to restore it.</p><button class="sheet-option" id="mergeBackup">Merge safely</button><button class="sheet-option danger-text" id="replaceBackup">Replace current library</button>`;
+    $('#mergeBackup').onclick = () => restoreBackup('merge'); $('#replaceBackup').onclick = () => restoreBackup('replace'); showSheet();
+  } catch (error) { toast(error.message || 'That backup could not be read.'); } finally { hideProgress(); }
+}
+async function clearBackupStores() {
+  const transaction = db.transaction(['tracks', 'audioBlobs', 'playlists', 'artworkBlobs', 'settings'], 'readwrite');
+  ['tracks', 'audioBlobs', 'playlists', 'artworkBlobs', 'settings'].forEach((name) => transaction.objectStore(name).clear());
+  await new Promise((resolve, reject) => { transaction.oncomplete = resolve; transaction.onerror = () => reject(transaction.error); });
+}
+async function restoreBackup(mode) {
+  const backup = pendingBackup; if (!backup) return;
+  if (mode === 'replace' && !confirm('Replace all Zombie music, playlists, artwork, and settings with this backup? This cannot be undone.')) return;
+  try {
+    closeSheet(); showProgress('Restoring Zombie', 'Keeping your backup local on this iPhone');
+    if (mode === 'replace') { audio.pause(); audio.removeAttribute('src'); audio.load(); if (currentUrl) URL.revokeObjectURL(currentUrl); currentUrl = null; currentId = null; await clearBackupStores(); }
+    const localTracks = await readAll('tracks'); const idMap = new Map();
+    for (const source of backup.tracks) {
+      const existing = mode === 'merge' && localTracks.find((track) => track.fingerprint && track.fingerprint === source.fingerprint);
+      if (existing) { const merged = { ...existing, ...cleanTrack(source), id: existing.id, artworkId: remapArtworkId(source.artworkId, new Map([[source.id, existing.id]])), blobStored: existing.blobStored }; await saveRecord('tracks', merged); idMap.set(source.id, existing.id); }
+      else if (backup.kind === 'full' && backup.audio.some((entry) => entry.id === source.id)) { await saveRecord('tracks', cleanTrack(source)); idMap.set(source.id, source.id); }
+    }
+    for (const source of backup.audio) { if (backup.kind === 'full' && idMap.get(source.id) === source.id) await saveRecord('audioBlobs', { id: source.id, blob: base64ToBlob(source.data, source.type) }); }
+    for (const source of backup.artwork) { const targetId = remapArtworkId(source.id, idMap); if (mode === 'replace' || source.id.startsWith('playlist:') || [...idMap.keys()].some((id) => source.id === `track:${id}`)) await saveRecord('artworkBlobs', { id: targetId, blob: base64ToBlob(source.data, source.type) }); }
+    for (const source of backup.playlists) {
+      const mappedIds = (source.trackIds || []).map((id) => idMap.get(id)).filter(Boolean);
+      const existing = mode === 'merge' && playlists.find((playlist) => playlist.name === source.name);
+      if (existing) { existing.trackIds = [...new Set([...existing.trackIds, ...mappedIds])]; await saveRecord('playlists', existing); }
+      else if (mode === 'replace' || mappedIds.length) await saveRecord('playlists', { ...source, id: existing?.id || source.id, trackIds: mappedIds });
+    }
+    if (mode === 'replace') for (const setting of backup.settings) await saveRecord('settings', setting);
+    if (mode === 'merge') for (const setting of backup.settings.filter((setting) => setting.key !== 'playerState')) await saveRecord('settings', setting);
+    await loadLibrary(); await restorePlayerState(); $('#volumeControl').value = audio.volume; if (currentId) showMiniPlayer(tracks.find((track) => track.id === currentId)); else $('#miniPlayer').classList.add('hidden'); render(); refreshStorageStatus(); pendingBackup = null;
+    toast(mode === 'replace' ? 'Zombie backup restored' : 'Zombie backup merged safely');
+  } catch { toast('Zombie could not restore that backup. Nothing else was deleted.'); } finally { hideProgress(); }
 }
 function deleteRecord(name, key) {
   return new Promise((resolve, reject) => { const request = store(name, 'readwrite').delete(key); request.onsuccess = resolve; request.onerror = () => reject(request.error); });
@@ -535,7 +600,14 @@ async function refreshStorageStatus() {
     $('#storageStatus').textContent = `${formatBytes(usage)} used${quota ? ` of ${formatBytes(quota)}` : ''} · ${libraryStats()}`;
     const persisted = await navigator.storage?.persisted?.();
     $('#persistenceStatus').textContent = persisted ? 'Storage protection is enabled.' : 'Ask iPhone to protect this library from cleanup.';
+    refreshLibraryStats();
   } catch { $('#storageStatus').textContent = `${tracks.length} songs stored on this device`; }
+}
+function refreshLibraryStats() {
+  const favorites = tracks.filter((track) => track.isFavorite).length;
+  const mostPlayed = [...tracks].sort((a, b) => (b.playCount || 0) - (a.playCount || 0))[0];
+  const recent = [...tracks].sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 2).map((track) => track.title).join(', ');
+  $('#libraryStats').textContent = `${libraryStats()} · ${playlists.length} ${playlists.length === 1 ? 'playlist' : 'playlists'} · ${favorites} favorites${mostPlayed?.playCount ? ` · Most played: ${mostPlayed.title}` : ''}${recent ? ` · Recent: ${recent}` : ''}`;
 }
 async function requestPersistentStorage() {
   try { const granted = await navigator.storage?.persist?.(); await refreshStorageStatus(); toast(granted ? 'Zombie storage is protected' : 'iPhone manages storage automatically'); } catch { toast('Storage protection is unavailable here'); }
@@ -553,10 +625,12 @@ function wireUI() {
   $('#importButton').onclick = () => $('#fileInput').click(); $('#chooseFiles').onclick = () => $('#fileInput').click();
   $('#fileInput').onchange = (event) => { importFiles(event.target.files); event.target.value = ''; };
   $('#artInput').onchange = (event) => { saveSelectedArtwork(event.target.files?.[0]); event.target.value = ''; };
+  $('#backupInput').onchange = (event) => { chooseBackupFile(event.target.files?.[0]); event.target.value = ''; };
   $('#searchInput').oninput = () => { activePlaylistId = null; render(); }; $('#sortSelect').onchange = render;
   document.querySelectorAll('.tab').forEach((button) => button.onclick = () => { currentView = button.dataset.view; collectionFilter = null; activePlaylistId = null; render(); });
   document.querySelectorAll('.bottom-nav button').forEach((button) => button.onclick = () => { currentView = button.dataset.nav === 'settings' ? 'settings' : 'songs'; collectionFilter = null; activePlaylistId = null; render(); });
   $('#storageRefresh').onclick = refreshStorageStatus; $('#persistenceButton').onclick = requestPersistentStorage; $('#clearMusicButton').onclick = clearAllMusic;
+  $('#exportBackupButton').onclick = () => exportBackup(false); $('#exportFullBackupButton').onclick = () => exportBackup(true); $('#restoreBackupButton').onclick = () => $('#backupInput').click();
   $('[data-action="back-to-library"]').onclick = () => { currentView = 'songs'; render(); };
   $('#openNowPlaying').onclick = openNowPlaying; $('#closeNowPlaying').onclick = closeNowPlaying;
   $('#miniPlay').onclick = togglePlayback; $('#miniNext').onclick = () => nextTrack(); $('#miniPrevious').onclick = previousTrack;
@@ -584,7 +658,7 @@ function wireUI() {
 async function initialise() {
   try {
     await openDatabase(); await loadLibrary(); await restorePlayerState(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#duration').textContent = formatTime(track.duration); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=11').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=12').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
