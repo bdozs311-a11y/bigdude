@@ -124,9 +124,6 @@ function configureMediaSession() {
   const actions = {
     play: () => audio.play().catch(() => {}), pause: () => audio.pause(),
     previoustrack: () => previousTrack(), nexttrack: () => nextTrack(),
-    seekbackward: (details) => { audio.currentTime = Math.max(0, audio.currentTime - (details.seekOffset || 10)); },
-    seekforward: (details) => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + (details.seekOffset || 10)); },
-    seekto: (details) => { if (Number.isFinite(details.seekTime)) audio.currentTime = Math.min(Math.max(0, details.seekTime), audio.duration || details.seekTime); },
   };
   Object.entries(actions).forEach(([action, handler]) => { try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* action not exposed by this iOS version */ } });
 }
@@ -204,7 +201,7 @@ function renderTrackList(area, list, playlist = null) {
   }
   list.forEach((track, position) => {
     const item = document.createElement('article'); item.className = `track ${track.id === currentId ? 'active' : ''}`;
-    item.innerHTML = `<button class="track-main" aria-label="Play ${escapeHTML(track.title)}"><span class="cover art-${artVariant(track)}" data-art="${track.id}">Z</span><span class="track-copy"><strong><i class="title-emoji">${track.emoji}</i>${escapeHTML(track.title)}${track.id === currentId ? '<span class="playing-bars" aria-label="Playing"><i></i><i></i><i></i></span>' : ''}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album)}${track.genre ? ` · <em>${escapeHTML(track.genre)}</em>` : ''}</small></span></button><button class="favorite ${track.isFavorite ? 'selected' : ''}" aria-label="${track.isFavorite ? 'Remove from' : 'Add to'} favorites">${track.isFavorite ? '♥' : '♡'}</button><button class="more" aria-label="Song options">⋯</button>${playlist ? `<span class="reorder"><button aria-label="Move song up">↑</button><button aria-label="Move song down">↓</button><button aria-label="Remove from playlist">×</button></span>` : '<button class="delete" aria-label="Delete from device">×</button>'}`;
+    item.innerHTML = `<button class="track-main" aria-label="Play ${escapeHTML(track.title)}"><span class="cover art-${artVariant(track)}" data-art="${track.id}">Z</span><span class="track-copy"><strong><i class="title-emoji">${track.emoji}</i>${escapeHTML(track.title)}${track.id === currentId && !audio.paused ? '<span class="playing-bars" aria-label="Playing"><i></i><i></i><i></i></span>' : ''}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album)}${track.genre ? ` · <em>${escapeHTML(track.genre)}</em>` : ''}</small></span></button><button class="favorite ${track.isFavorite ? 'selected' : ''}" aria-label="${track.isFavorite ? 'Remove from' : 'Add to'} favorites">${track.isFavorite ? '♥' : '♡'}</button><button class="more" aria-label="Song options">⋯</button>${playlist ? `<span class="reorder"><button aria-label="Move song up">↑</button><button aria-label="Move song down">↓</button><button aria-label="Remove from playlist">×</button></span>` : '<button class="delete" aria-label="Delete from device">×</button>'}`;
     item.querySelector('.track-main').onclick = () => playTrack(track.id, list.map((entry) => entry.id));
     item.querySelector('.favorite').onclick = () => toggleFavorite(track.id);
     item.querySelector('.more').onclick = () => openSongOptions(track.id);
@@ -517,7 +514,6 @@ function wireUI() {
   $('#openNowPlaying').onclick = openNowPlaying; $('#closeNowPlaying').onclick = closeNowPlaying;
   $('#miniPlay').onclick = () => audio.paused ? audio.play() : audio.pause(); $('#miniNext').onclick = () => nextTrack(); $('#miniPrevious').onclick = previousTrack;
   $('#playButton').onclick = () => audio.paused ? audio.play() : audio.pause(); $('#nextButton').onclick = () => nextTrack(); $('#previousButton').onclick = previousTrack;
-  $('#backButton').onclick = () => audio.currentTime = Math.max(0, audio.currentTime - 10); $('#forwardButton').onclick = () => audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 10);
   $('#shuffleButton').onclick = () => { shuffleOn = !shuffleOn; if (shuffleOn) refillShuffleBag(); updatePlayerMode(); toast(shuffleOn ? 'Shuffle on' : 'Shuffle off'); };
   $('#repeatButton').onclick = () => { repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off'; updatePlayerMode(); toast(`Repeat ${repeatMode}`); };
   $('#npSeek').oninput = (event) => { if (audio.duration) audio.currentTime = (event.target.value / 100) * audio.duration; };
@@ -527,20 +523,20 @@ function wireUI() {
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
   audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#currentTime').textContent = formatTime(audio.currentTime); updateMediaPosition(); };
   audio.onloadedmetadata = () => { $('#duration').textContent = formatTime(audio.duration); updateMediaPosition(); };
-  audio.onplay = () => { $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; const track = tracks.find((entry) => entry.id === currentId); if (track && countedSerial !== playbackSerial) { countedSerial = playbackSerial; track.playCount = (track.playCount || 0) + 1; track.lastPlayed = Date.now(); saveRecord('tracks', track).catch(() => {}); } updateMediaSession(track); };
-  audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; };
+  audio.onplay = () => { $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; const track = tracks.find((entry) => entry.id === currentId); if (track && countedSerial !== playbackSerial) { countedSerial = playbackSerial; track.playCount = (track.playCount || 0) + 1; track.lastPlayed = Date.now(); saveRecord('tracks', track).catch(() => {}); } updateMediaSession(track); render(); };
+  audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; render(); };
   audio.onended = () => { void advanceAfterEnded(); };
   audio.onerror = () => { if (currentId) toast('This audio file cannot be played on this iPhone'); };
-  let miniTouchY = null, fullTouchY = null;
-  $('#miniPlayer').addEventListener('touchstart', (event) => { miniTouchY = event.changedTouches[0]?.clientY ?? null; }, { passive: true });
-  $('#miniPlayer').addEventListener('touchend', (event) => { const endY = event.changedTouches[0]?.clientY; if (miniTouchY !== null && miniTouchY - endY > 36) openNowPlaying(); miniTouchY = null; }, { passive: true });
+  let miniTouch = null, fullTouchY = null;
+  $('#miniPlayer').addEventListener('touchstart', (event) => { if (event.target.closest('#miniPrevious,#miniPlay,#miniNext')) { miniTouch = null; return; } const touch = event.changedTouches[0]; miniTouch = touch ? { x: touch.clientX, y: touch.clientY } : null; }, { passive: true });
+  $('#miniPlayer').addEventListener('touchend', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; if (Math.abs(dx) > 65 && Math.abs(dx) > Math.abs(dy) * 1.3) { dx < 0 ? nextTrack() : previousTrack(); } else if (dy < -40 && Math.abs(dy) > Math.abs(dx)) openNowPlaying(); miniTouch = null; }, { passive: true });
   $('#nowPlayingScreen').addEventListener('touchstart', (event) => { fullTouchY = event.changedTouches[0]?.clientY ?? null; }, { passive: true });
   $('#nowPlayingScreen').addEventListener('touchend', (event) => { const endY = event.changedTouches[0]?.clientY; if (fullTouchY !== null && endY - fullTouchY > 70) closeNowPlaying(); fullTouchY = null; }, { passive: true });
 }
 async function initialise() {
   try {
     await openDatabase(); await loadLibrary(); wireUI(); configureMediaSession(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=8').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=9').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
