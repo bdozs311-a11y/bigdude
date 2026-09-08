@@ -3,41 +3,80 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#11111a" />
+    <meta name="theme-color" content="#050505" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <link rel="manifest" href="manifest.webmanifest?v=5" />
+    <meta name="apple-mobile-web-app-title" content="Zombie" />
+    <link rel="manifest" href="manifest.webmanifest?v=6" />
     <link rel="apple-touch-icon" href="icon.svg" />
-    <link rel="stylesheet" href="style.css?v=5" />
+    <link rel="stylesheet" href="style.css?v=6" />
     <title>Zombie</title>
   </head>
   <body>
     <main class="app-shell">
-      <header>
-        <p class="eyebrow">OFFLINE MUSIC VAULT</p>
-        <div class="header-row"><h1>Zombie</h1><button id="importButton" class="round-button" aria-label="Add audio">＋</button></div>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">YOUR OFFLINE MUSIC</p>
+          <h1 id="screenTitle">Zombie</h1>
+        </div>
+        <button id="importButton" class="round-button" aria-label="Add audio">＋</button>
         <input id="fileInput" type="file" accept="audio/*,video/*,.mp3,.m4a,.wav,.aac,.flac,.ogg,.opus,.mp4,.mov,.webm" multiple hidden />
-        <label class="search"><span>⌕</span><input id="searchInput" type="search" placeholder="Search your library" /></label>
       </header>
 
-      <section id="dropZone" class="drop-zone">
-        <div class="drop-icon">♫</div>
-        <div><strong>Add music or recordings</strong><p>Choose files from your iPhone, or drop them here.</p></div>
-        <button id="chooseFiles" class="secondary-button">Choose files</button>
+      <section id="libraryScreen">
+        <label class="search"><span>⌕</span><input id="searchInput" type="search" placeholder="Search songs, artists, albums" /></label>
+        <nav class="library-tabs" aria-label="Library sections">
+          <button class="tab active" data-view="songs">Songs</button>
+          <button class="tab" data-view="recent">Recent</button>
+          <button class="tab" data-view="favorites">Favorites</button>
+          <button class="tab" data-view="albums">Albums</button>
+          <button class="tab" data-view="artists">Artists</button>
+          <button class="tab" data-view="playlists">Playlists</button>
+        </nav>
+        <section id="importArea" class="import-area">
+          <div class="import-icon">🧟</div>
+          <div><strong>Add music to Zombie</strong><p>MP3, M4A, AAC, WAV, or screen recordings. Saved only on this iPhone.</p></div>
+          <button id="chooseFiles" class="secondary-button">Choose files</button>
+        </section>
+        <section class="library-toolbar">
+          <p id="librarySummary">0 songs</p>
+          <label class="sort-label">Sort <select id="sortSelect"><option value="recent">Recently added</option><option value="title">Title</option><option value="artist">Artist</option><option value="album">Album</option></select></label>
+        </section>
+        <section id="contentArea" class="content-area" aria-live="polite"></section>
+        <section id="emptyState" class="empty-state"><div>☠</div><h2>Wake up your library</h2><p>Import audio once, then listen from Zombie even without internet.</p></section>
       </section>
 
-      <section class="library-heading"><h2>Library</h2><span id="libraryCount">0 tracks</span></section>
-      <section id="trackList" class="track-list" aria-live="polite"></section>
-      <section id="emptyState" class="empty-state"><div>☠</div><h2>Wake up your library</h2><p>Import an MP3, M4A, WAV, or a screen recording to keep it here offline.</p></section>
+      <section id="settingsScreen" class="settings-screen hidden">
+        <button class="back-link" data-action="back-to-library">‹ Library</button>
+        <h2>Settings</h2>
+        <article class="setting-card"><div><strong>Local storage</strong><span id="storageStatus">Calculating…</span></div><button id="storageRefresh" class="text-button">Refresh</button></article>
+        <article class="setting-card"><div><strong>Keep music on this iPhone</strong><span id="persistenceStatus">Checking storage protection…</span></div><button id="persistenceButton" class="text-button">Protect</button></article>
+        <article class="setting-card danger"><div><strong>Clear all music</strong><span>Removes songs, favorites, and playlists from this device.</span></div><button id="clearMusicButton" class="danger-button">Clear</button></article>
+        <p class="privacy-note">Zombie never uploads your imported music. Audio lives in this browser’s on-device storage.</p>
+      </section>
     </main>
 
-    <footer id="player" class="player hidden">
-      <div class="now-playing"><div id="nowCover" class="cover small-cover">🧟</div><div><strong id="nowTitle">Nothing playing</strong><span id="nowArtist">Choose a file to begin</span></div></div>
-      <div class="controls"><button id="shuffleButton" aria-label="Shuffle">⇄</button><button id="previousButton" aria-label="Previous track">|◀</button><button id="backButton" aria-label="Go back 10 seconds">↺<small>10</small></button><button id="playButton" class="play-button" aria-label="Play">▶</button><button id="forwardButton" aria-label="Skip ahead 10 seconds">↻<small>10</small></button><button id="nextButton" aria-label="Next track">▶|</button><button id="repeatButton" aria-label="Repeat off">↻</button></div>
-      <div class="timeline"><span id="currentTime">0:00</span><input id="seekBar" type="range" min="0" max="100" value="0" aria-label="Playback position" /><span id="duration">0:00</span></div>
-      <audio id="audio"></audio>
-    </footer>
+    <nav class="bottom-nav" aria-label="Main navigation"><button data-nav="library" class="active"><span>♫</span>Library</button><button data-nav="settings"><span>⚙</span>Settings</button></nav>
+
+    <section id="miniPlayer" class="mini-player hidden" aria-label="Now playing">
+      <button id="openNowPlaying" class="mini-track"><span id="miniArt" class="mini-art">🧟</span><span><strong id="nowTitle">Nothing playing</strong><small id="nowArtist">Choose a song to begin</small></span></button>
+      <button id="miniPrevious" aria-label="Previous track">|◀</button><button id="miniPlay" class="mini-play" aria-label="Play">▶</button><button id="miniNext" aria-label="Next track">▶|</button>
+    </section>
+
+    <section id="nowPlayingScreen" class="now-playing-screen hidden" aria-modal="true" role="dialog" aria-label="Now playing">
+      <div class="np-header"><button id="closeNowPlaying" aria-label="Close now playing">⌄</button><span>NOW PLAYING</span><button id="npFavorite" aria-label="Favorite">♡</button></div>
+      <div id="npArt" class="large-art">🧟</div>
+      <div class="np-song"><div><h2 id="npTitle">Nothing playing</h2><p id="npArtist">Choose a song to begin</p></div><button id="npMore" aria-label="Add current song to playlist">⋯</button></div>
+      <input id="npSeek" class="seek" type="range" min="0" max="100" value="0" aria-label="Playback position" />
+      <div class="time-row"><span id="currentTime">0:00</span><span id="duration">0:00</span></div>
+      <div class="player-controls"><button id="shuffleButton" aria-label="Shuffle">⇄</button><button id="previousButton" aria-label="Previous track">|◀</button><button id="backButton" aria-label="Go back 10 seconds">↺<small>10</small></button><button id="playButton" class="play-button" aria-label="Play">▶</button><button id="forwardButton" aria-label="Skip ahead 10 seconds">↻<small>10</small></button><button id="nextButton" aria-label="Next track">▶|</button><button id="repeatButton" aria-label="Repeat off">↻</button></div>
+      <label class="volume-control"><span>◔</span><input id="volumeControl" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume" /><span>◕</span></label>
+    </section>
+
+    <section id="sheet" class="sheet hidden" role="dialog" aria-modal="true"><div class="sheet-card"><div class="sheet-handle"></div><button id="sheetClose" class="sheet-close" aria-label="Close">×</button><h2 id="sheetTitle">Add to playlist</h2><div id="sheetContent"></div></div></section>
+    <section id="importProgress" class="progress-overlay hidden" role="status"><div><div class="spinner"></div><strong id="progressTitle">Saving music…</strong><span id="progressDetail">Please keep Zombie open</span></div></section>
     <div id="toast" class="toast" role="status"></div>
-    <script src="app.js?v=5"></script>
+    <audio id="audio" preload="metadata"></audio>
+    <script src="app.js?v=6"></script>
   </body>
 </html>

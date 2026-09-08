@@ -1,1 +1,1 @@
-{"name":"Zombie","short_name":"Zombie","start_url":"./","display":"standalone","background_color":"#050505","theme_color":"#050505","icons":[{"src":"icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]}
+{"name":"Zombie","short_name":"Zombie","start_url":"./","scope":"./","display":"standalone","orientation":"portrait","background_color":"#050505","theme_color":"#050505","icons":[{"src":"icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}
