@@ -18,6 +18,7 @@ const formatTime = (seconds) => !Number.isFinite(seconds) ? '0:00' : `${Math.flo
 const formatBytes = (bytes = 0) => bytes < 1e6 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1e6).toFixed(1)} MB`;
 const formatTotalDuration = (seconds = 0) => { const minutes = Math.round(seconds / 60); const days = Math.floor(minutes / 1440); const hours = Math.floor((minutes % 1440) / 60); const mins = minutes % 60; return `${days ? `${days} day${days === 1 ? '' : 's'} ` : ''}${hours ? `${hours} hr ` : ''}${mins ? `${mins} min` : '0 min'}`.trim(); };
 const escapeHTML = (value = '') => { const element = document.createElement('span'); element.textContent = value; return element.innerHTML; };
+const libraryStats = (list = tracks) => `${list.length} ${list.length === 1 ? 'song' : 'songs'} · ${formatTotalDuration(list.reduce((total, track) => total + (Number(track.duration) || 0), 0))}`;
 
 function toast(message) {
   const element = $('#toast');
@@ -89,9 +90,45 @@ async function applyArtwork(element, track) {
   element.className = `${element.className.split(' ').filter((name) => !name.startsWith('art-')).join(' ')} art-${artVariant(track)}`;
   element.style.backgroundImage = '';
   element.classList.remove('has-art');
-  element.textContent = 'Z';
+  element.textContent = '';
   if (!track?.artworkId) return;
   try { const record = await getRecord('artworkBlobs', track.artworkId); if (!record?.blob) return; let url = artworkUrls.get(track.artworkId); if (!url) { url = URL.createObjectURL(record.blob); artworkUrls.set(track.artworkId, url); } element.style.backgroundImage = `url("${url}")`; element.classList.add('has-art'); element.textContent = ''; } catch { /* fall back to local Zombie art */ }
+}
+async function mediaArtworkFor(track) {
+  const fallback = new URL('icon.svg', location.href).href;
+  if (!track?.artworkId) return fallback;
+  try {
+    const record = await getRecord('artworkBlobs', track.artworkId);
+    if (!record?.blob) return fallback;
+    let url = artworkUrls.get(track.artworkId);
+    if (!url) { url = URL.createObjectURL(record.blob); artworkUrls.set(track.artworkId, url); }
+    return url;
+  } catch { return fallback; }
+}
+function updateMediaPosition() {
+  if (!navigator.mediaSession?.setPositionState || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
+  try { navigator.mediaSession.setPositionState({ duration: audio.duration, position: Math.min(Math.max(audio.currentTime || 0, 0), audio.duration), playbackRate: audio.playbackRate || 1 }); } catch { /* unsupported browser detail */ }
+}
+async function updateMediaSession(track = tracks.find((entry) => entry.id === currentId)) {
+  if (!track || !('mediaSession' in navigator) || !window.MediaMetadata) return;
+  const art = await mediaArtworkFor(track);
+  if (track.id !== currentId) return;
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({ title: track.title, artist: track.artist, album: track.album, artwork: [{ src: art, sizes: '512x512' }] });
+    navigator.mediaSession.playbackState = audio.paused ? 'paused' : 'playing';
+    updateMediaPosition();
+  } catch { /* Media Session is optional on older iPhones */ }
+}
+function configureMediaSession() {
+  if (!('mediaSession' in navigator)) return;
+  const actions = {
+    play: () => audio.play().catch(() => {}), pause: () => audio.pause(),
+    previoustrack: () => previousTrack(), nexttrack: () => nextTrack(),
+    seekbackward: (details) => { audio.currentTime = Math.max(0, audio.currentTime - (details.seekOffset || 10)); },
+    seekforward: (details) => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + (details.seekOffset || 10)); },
+    seekto: (details) => { if (Number.isFinite(details.seekTime)) audio.currentTime = Math.min(Math.max(0, details.seekTime), audio.duration || details.seekTime); },
+  };
+  Object.entries(actions).forEach(([action, handler]) => { try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* action not exposed by this iOS version */ } });
 }
 function artVariant(track) { let hash = 0; for (const character of `${track?.title || ''}${track?.artist || ''}${track?.genre || ''}`) hash = ((hash << 5) - hash) + character.charCodeAt(0); return Math.abs(hash) % 6; }
 function randomize(values) {
@@ -135,7 +172,9 @@ function visibleTracks() {
     if (sort === 'recent') list.sort((a, b) => b.addedAt - a.addedAt);
     if (sort === 'oldest') list.sort((a, b) => a.addedAt - b.addedAt);
     if (sort === 'plays') list.sort((a, b) => b.playCount - a.playCount);
+    if (sort === 'least') list.sort((a, b) => a.playCount - b.playCount);
     if (sort === 'played') list.sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
+    if (sort === 'duration') list.sort((a, b) => (b.duration || 0) - (a.duration || 0));
   }
   return list;
 }
@@ -157,7 +196,7 @@ function render() {
   else renderTrackList(area, visibleTracks());
 }
 function renderTrackList(area, list, playlist = null) {
-  $('#librarySummary').textContent = `${list.length} ${list.length === 1 ? 'song' : 'songs'}`;
+  $('#librarySummary').textContent = libraryStats(list);
   $('#emptyState').style.display = list.length || ['albums', 'artists', 'playlists'].includes(currentView) ? 'none' : 'block';
   if (!list.length) {
     area.innerHTML = currentView === 'favorites' ? '<div class="inline-empty">No favorites yet. Tap ♡ on a song to save it here.</div>' : playlist ? '<div class="inline-empty">This playlist is empty. Add songs from your library.</div>' : '';
@@ -165,7 +204,7 @@ function renderTrackList(area, list, playlist = null) {
   }
   list.forEach((track, position) => {
     const item = document.createElement('article'); item.className = `track ${track.id === currentId ? 'active' : ''}`;
-    item.innerHTML = `<button class="track-main" aria-label="Play ${escapeHTML(track.title)}"><span class="cover art-${artVariant(track)}" data-art="${track.id}">Z</span><span class="track-copy"><strong><i class="title-emoji">${track.emoji}</i>${escapeHTML(track.title)}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album)}${track.genre ? ` · <em>${escapeHTML(track.genre)}</em>` : ''}</small></span></button><button class="favorite ${track.isFavorite ? 'selected' : ''}" aria-label="${track.isFavorite ? 'Remove from' : 'Add to'} favorites">${track.isFavorite ? '♥' : '♡'}</button><button class="more" aria-label="Song options">⋯</button>${playlist ? `<span class="reorder"><button aria-label="Move song up">↑</button><button aria-label="Move song down">↓</button><button aria-label="Remove from playlist">×</button></span>` : '<button class="delete" aria-label="Delete from device">×</button>'}`;
+    item.innerHTML = `<button class="track-main" aria-label="Play ${escapeHTML(track.title)}"><span class="cover art-${artVariant(track)}" data-art="${track.id}">Z</span><span class="track-copy"><strong><i class="title-emoji">${track.emoji}</i>${escapeHTML(track.title)}${track.id === currentId ? '<span class="playing-bars" aria-label="Playing"><i></i><i></i><i></i></span>' : ''}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album)}${track.genre ? ` · <em>${escapeHTML(track.genre)}</em>` : ''}</small></span></button><button class="favorite ${track.isFavorite ? 'selected' : ''}" aria-label="${track.isFavorite ? 'Remove from' : 'Add to'} favorites">${track.isFavorite ? '♥' : '♡'}</button><button class="more" aria-label="Song options">⋯</button>${playlist ? `<span class="reorder"><button aria-label="Move song up">↑</button><button aria-label="Move song down">↓</button><button aria-label="Remove from playlist">×</button></span>` : '<button class="delete" aria-label="Delete from device">×</button>'}`;
     item.querySelector('.track-main').onclick = () => playTrack(track.id, list.map((entry) => entry.id));
     item.querySelector('.favorite').onclick = () => toggleFavorite(track.id);
     item.querySelector('.more').onclick = () => openSongOptions(track.id);
@@ -239,7 +278,7 @@ async function playTrack(id, sourceIds = null) {
     if (token !== loadToken) return;
     if (!blob) { toast('This song is missing from device storage'); return; }
     currentUrl = URL.createObjectURL(blob); currentId = id; playbackSerial += 1; audio.src = currentUrl; audio.load();
-    syncNowPlaying(track); render();
+    syncNowPlaying(track); render(); updateMediaSession(track);
     await audio.play();
   } catch (error) {
     if (token === loadToken) toast('Zombie could not play this file');
@@ -250,7 +289,7 @@ function syncNowPlaying(track = tracks.find((entry) => entry.id === currentId)) 
   if (!track) return;
   $('#nowTitle').textContent = track.title; $('#nowArtist').textContent = track.artist;
   applyArtwork($('#miniArt'), track); applyArtwork($('#npArt'), track);
-  $('#npTitle').textContent = track.title; $('#npArtist').textContent = `${track.artist} · ${track.album}`;
+  $('#npEmoji').textContent = track.emoji; $('#npTitle').textContent = track.title; $('#npArtist').textContent = `${track.artist} · ${track.album}`;
   $('#npFavorite').textContent = track.isFavorite ? '♥' : '♡';
 }
 function refillShuffleBag() {
@@ -272,6 +311,9 @@ async function nextTrack(fromEnd = false) {
   }
   if (id) await playTrack(id);
 }
+async function advanceAfterEnded() {
+  try { await nextTrack(true); } catch { toast('Zombie could not start the next song'); }
+}
 async function previousTrack() {
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
   if (shuffleOn && shuffleHistory.length) { const id = shuffleHistory.pop(); if (currentId) shuffleBag.unshift(currentId); await playTrack(id); return; }
@@ -285,6 +327,15 @@ function updatePlayerMode() {
   $('#repeatButton').classList.toggle('mode-active', repeatMode !== 'off');
   $('#repeatButton').textContent = repeatMode === 'one' ? '↻¹' : '↻';
   $('#repeatButton').setAttribute('aria-label', `Repeat ${repeatMode}`);
+}
+function openNowPlaying() { if (currentId) $('#nowPlayingScreen').classList.remove('hidden'); }
+function closeNowPlaying() { $('#nowPlayingScreen').classList.add('hidden'); }
+function openQueue() {
+  const queueTracks = queue.map((id) => tracks.find((track) => track.id === id)).filter(Boolean);
+  $('#sheetTitle').textContent = 'Up next';
+  $('#sheetContent').innerHTML = queueTracks.length ? queueTracks.map((track, index) => `<button class="sheet-option queue-item ${track.id === currentId ? 'queue-current' : ''}" data-queue-id="${track.id}"><span>${index === queueIndex ? '▶' : '·'}</span><span>${track.emoji} ${escapeHTML(track.title)}<small>${escapeHTML(track.artist)}</small></span></button>`).join('') : '<p class="sheet-note">Choose a song to start a queue.</p>';
+  document.querySelectorAll('[data-queue-id]').forEach((button) => { button.onclick = () => { closeSheet(); playTrack(button.dataset.queueId); }; });
+  $('#sheet').classList.remove('hidden');
 }
 
 async function metadataFor(file) {
@@ -374,7 +425,7 @@ function openPlaylistSheet(trackId) {
 }
 async function addToPlaylist(playlistId, trackId) {
   const playlist = playlists.find((entry) => entry.id === playlistId); if (!playlist) return;
-  if (playlist.trackIds.includes(trackId)) { toast('Already in that playlist'); return; }
+  if (playlist.trackIds.includes(trackId)) { playlist.trackIds = playlist.trackIds.filter((id) => id !== trackId); await savePlaylist(playlist); closeSheet(); toast(`Removed from ${playlist.name}`); return; }
   playlist.trackIds.push(trackId); await savePlaylist(playlist); closeSheet(); toast(`Added to ${playlist.name}`);
 }
 function openPlaylistOptions(id) {
@@ -392,25 +443,34 @@ function closeSheet() { $('#sheet').classList.add('hidden'); }
 function openSongOptions(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = track.title;
-  $('#sheetContent').innerHTML = '<button class="sheet-option" data-action="playlist">Add to playlist</button><button class="sheet-option" data-action="edit">Edit song information</button><button class="sheet-option" data-action="details">Song details</button>';
+  $('#sheetContent').innerHTML = `<button class="sheet-option" data-action="favorite">${track.isFavorite ? 'Remove from favorites' : 'Add to favorites'}</button><button class="sheet-option" data-action="playlist">Add or remove from playlist</button><button class="sheet-option" data-action="edit">Edit song information</button><button class="sheet-option" data-action="details">Song details</button><button class="sheet-option danger-text" data-action="delete">Delete song</button>`;
+  $('#sheetContent').querySelector('[data-action="favorite"]').onclick = async () => { await toggleFavorite(id); closeSheet(); };
   $('#sheetContent').querySelector('[data-action="playlist"]').onclick = () => openPlaylistSheet(id);
   $('#sheetContent').querySelector('[data-action="edit"]').onclick = () => openSongEditor(id);
   $('#sheetContent').querySelector('[data-action="details"]').onclick = () => openSongDetails(id);
+  $('#sheetContent').querySelector('[data-action="delete"]').onclick = () => { closeSheet(); deleteTrack(id); };
   $('#sheet').classList.remove('hidden');
 }
 function openSongDetails(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = 'Song information';
-  $('#sheetContent').innerHTML = `<dl class="song-details"><dt>Title</dt><dd>${escapeHTML(track.title)}</dd><dt>Artist</dt><dd>${escapeHTML(track.artist)}</dd><dt>Album</dt><dd>${escapeHTML(track.album)}</dd><dt>Genre</dt><dd>${escapeHTML(track.genre || 'Not set')}</dd><dt>Duration</dt><dd>${formatTime(track.duration)}</dd><dt>Added</dt><dd>${new Date(track.addedAt).toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'})}</dd><dt>Plays</dt><dd>${track.playCount || 0}</dd><dt>File</dt><dd>${escapeHTML(track.fileName || track.title)}</dd></dl><button class="sheet-option" id="editFromDetails">Edit song</button>`;
+  $('#sheetContent').innerHTML = `<dl class="song-details"><dt>Title</dt><dd>${escapeHTML(track.title)}</dd><dt>Artist</dt><dd>${escapeHTML(track.artist)}</dd><dt>Album</dt><dd>${escapeHTML(track.album)}</dd><dt>Genre</dt><dd>${escapeHTML(track.genre || 'Not set')}</dd><dt>Duration</dt><dd>${formatTime(track.duration)}</dd><dt>Added</dt><dd>${new Date(track.addedAt).toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'})}</dd><dt>Last played</dt><dd>${track.lastPlayed ? new Date(track.lastPlayed).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'}) : 'Not played yet'}</dd><dt>Plays</dt><dd>${track.playCount || 0}</dd><dt>File</dt><dd>${escapeHTML(track.fileName || track.title)}</dd></dl><button class="sheet-option" id="editFromDetails">Edit song</button>`;
   $('#editFromDetails').onclick = () => openSongEditor(id); $('#sheet').classList.remove('hidden');
 }
 function openSongEditor(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = 'Edit song';
-  $('#sheetContent').innerHTML = `<label class="edit-field">Title<input id="editTitle" value="${escapeHTML(track.title)}"></label><label class="edit-field">Artist<input id="editArtist" value="${escapeHTML(track.artist)}"></label><label class="edit-field">Album<input id="editAlbum" value="${escapeHTML(track.album)}"></label><label class="edit-field">Genre<input id="editGenre" list="genreChoices" value="${escapeHTML(track.genre || '')}" placeholder="Optional genre"></label><datalist id="genreChoices"><option>Hip-Hop</option><option>R&B</option><option>Pop</option><option>Rock</option><option>Rap</option><option>Indie</option><option>Electronic</option><option>Reggae</option><option>Soul</option><option>Other</option></datalist><button class="sheet-option" id="chooseTrackArt">Choose artwork from Photos</button><button class="sheet-option" id="saveSongEdit">Save changes</button>`;
+  $('#sheetContent').innerHTML = `<label class="edit-field">Title<input id="editTitle" value="${escapeHTML(track.title)}"></label><label class="edit-field">Artist<input id="editArtist" value="${escapeHTML(track.artist)}"></label><label class="edit-field">Album<input id="editAlbum" value="${escapeHTML(track.album)}"></label><label class="edit-field">Emoji<input id="editEmoji" value="${escapeHTML(track.emoji)}" maxlength="8"></label><label class="edit-field">Genre<input id="editGenre" list="genreChoices" value="${escapeHTML(track.genre || '')}" placeholder="Optional genre"></label><datalist id="genreChoices"><option>Hip-Hop</option><option>R&B</option><option>Pop</option><option>Rock</option><option>Rap</option><option>Indie</option><option>Electronic</option><option>Reggae</option><option>Soul</option><option>Other</option></datalist><button class="sheet-option" id="chooseTrackArt">Choose artwork from Photos</button>${track.artworkId ? '<button class="sheet-option" id="removeTrackArt">Remove artwork</button>' : ''}<button class="sheet-option" id="saveSongEdit">Save changes</button>`;
   $('#chooseTrackArt').onclick = () => { artTarget = { type: 'track', id }; $('#artInput').click(); };
-  $('#saveSongEdit').onclick = async () => { track.title = $('#editTitle').value.trim() || 'Untitled song'; track.artist = $('#editArtist').value.trim() || 'Unknown artist'; track.album = $('#editAlbum').value.trim() || 'Single'; track.genre = $('#editGenre').value.trim(); await saveRecord('tracks', track); render(); syncNowPlaying(); closeSheet(); toast('Song details saved'); };
+  if ($('#removeTrackArt')) $('#removeTrackArt').onclick = async () => { await removeTrackArtwork(track); render(); syncNowPlaying(); closeSheet(); toast('Artwork removed'); };
+  $('#saveSongEdit').onclick = async () => { track.title = $('#editTitle').value.trim() || 'Untitled song'; track.artist = $('#editArtist').value.trim() || 'Unknown artist'; track.album = $('#editAlbum').value.trim() || 'Single'; track.emoji = $('#editEmoji').value.trim() || randomEmoji(); track.genre = $('#editGenre').value.trim(); await saveRecord('tracks', track); render(); syncNowPlaying(); updateMediaSession(track); closeSheet(); toast('Song details saved'); };
   $('#sheet').classList.remove('hidden');
+}
+async function removeTrackArtwork(track) {
+  if (!track?.artworkId) return;
+  const id = track.artworkId, url = artworkUrls.get(id);
+  if (url) URL.revokeObjectURL(url);
+  artworkUrls.delete(id); await deleteRecord('artworkBlobs', id); delete track.artworkId; await saveRecord('tracks', track);
 }
 async function saveSelectedArtwork(file) {
   if (!file || !artTarget) return;
@@ -428,7 +488,7 @@ async function refreshStorageStatus() {
     const estimate = await navigator.storage?.estimate?.();
     const usage = estimate?.usage || tracks.reduce((sum, track) => sum + (track.size || 0), 0);
     const quota = estimate?.quota;
-    $('#storageStatus').textContent = `${formatBytes(usage)} used${quota ? ` of ${formatBytes(quota)}` : ''} · ${tracks.length} songs`;
+    $('#storageStatus').textContent = `${formatBytes(usage)} used${quota ? ` of ${formatBytes(quota)}` : ''} · ${libraryStats()}`;
     const persisted = await navigator.storage?.persisted?.();
     $('#persistenceStatus').textContent = persisted ? 'Storage protection is enabled.' : 'Ask iPhone to protect this library from cleanup.';
   } catch { $('#storageStatus').textContent = `${tracks.length} songs stored on this device`; }
@@ -454,7 +514,7 @@ function wireUI() {
   document.querySelectorAll('.bottom-nav button').forEach((button) => button.onclick = () => { currentView = button.dataset.nav === 'settings' ? 'settings' : 'songs'; collectionFilter = null; activePlaylistId = null; render(); });
   $('#storageRefresh').onclick = refreshStorageStatus; $('#persistenceButton').onclick = requestPersistentStorage; $('#clearMusicButton').onclick = clearAllMusic;
   $('[data-action="back-to-library"]').onclick = () => { currentView = 'songs'; render(); };
-  $('#openNowPlaying').onclick = () => $('#nowPlayingScreen').classList.remove('hidden'); $('#closeNowPlaying').onclick = () => $('#nowPlayingScreen').classList.add('hidden');
+  $('#openNowPlaying').onclick = openNowPlaying; $('#closeNowPlaying').onclick = closeNowPlaying;
   $('#miniPlay').onclick = () => audio.paused ? audio.play() : audio.pause(); $('#miniNext').onclick = () => nextTrack(); $('#miniPrevious').onclick = previousTrack;
   $('#playButton').onclick = () => audio.paused ? audio.play() : audio.pause(); $('#nextButton').onclick = () => nextTrack(); $('#previousButton').onclick = previousTrack;
   $('#backButton').onclick = () => audio.currentTime = Math.max(0, audio.currentTime - 10); $('#forwardButton').onclick = () => audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 10);
@@ -462,20 +522,25 @@ function wireUI() {
   $('#repeatButton').onclick = () => { repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off'; updatePlayerMode(); toast(`Repeat ${repeatMode}`); };
   $('#npSeek').oninput = (event) => { if (audio.duration) audio.currentTime = (event.target.value / 100) * audio.duration; };
   $('#volumeControl').oninput = (event) => { audio.volume = Number(event.target.value); };
-  $('#npFavorite').onclick = () => currentId && toggleFavorite(currentId); $('#npMore').onclick = () => currentId && openPlaylistSheet(currentId);
+  $('#npFavorite').onclick = () => currentId && toggleFavorite(currentId); $('#npMore').onclick = () => currentId && openSongOptions(currentId); $('#queueButton').onclick = openQueue;
   $('#sheetClose').onclick = closeSheet; $('#sheet').onclick = (event) => { if (event.target === $('#sheet')) closeSheet(); };
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
-  audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#currentTime').textContent = formatTime(audio.currentTime); };
-  audio.onloadedmetadata = () => { $('#duration').textContent = formatTime(audio.duration); };
-  audio.onplay = () => { $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; const track = tracks.find((entry) => entry.id === currentId); if (track && countedSerial !== playbackSerial) { countedSerial = playbackSerial; track.playCount = (track.playCount || 0) + 1; track.lastPlayed = Date.now(); saveRecord('tracks', track).catch(() => {}); } };
-  audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; };
-  audio.onended = () => nextTrack(true);
+  audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#currentTime').textContent = formatTime(audio.currentTime); updateMediaPosition(); };
+  audio.onloadedmetadata = () => { $('#duration').textContent = formatTime(audio.duration); updateMediaPosition(); };
+  audio.onplay = () => { $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; const track = tracks.find((entry) => entry.id === currentId); if (track && countedSerial !== playbackSerial) { countedSerial = playbackSerial; track.playCount = (track.playCount || 0) + 1; track.lastPlayed = Date.now(); saveRecord('tracks', track).catch(() => {}); } updateMediaSession(track); };
+  audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; };
+  audio.onended = () => { void advanceAfterEnded(); };
   audio.onerror = () => { if (currentId) toast('This audio file cannot be played on this iPhone'); };
+  let miniTouchY = null, fullTouchY = null;
+  $('#miniPlayer').addEventListener('touchstart', (event) => { miniTouchY = event.changedTouches[0]?.clientY ?? null; }, { passive: true });
+  $('#miniPlayer').addEventListener('touchend', (event) => { const endY = event.changedTouches[0]?.clientY; if (miniTouchY !== null && miniTouchY - endY > 36) openNowPlaying(); miniTouchY = null; }, { passive: true });
+  $('#nowPlayingScreen').addEventListener('touchstart', (event) => { fullTouchY = event.changedTouches[0]?.clientY ?? null; }, { passive: true });
+  $('#nowPlayingScreen').addEventListener('touchend', (event) => { const endY = event.changedTouches[0]?.clientY; if (fullTouchY !== null && endY - fullTouchY > 70) closeNowPlaying(); fullTouchY = null; }, { passive: true });
 }
 async function initialise() {
   try {
-    await openDatabase(); await loadLibrary(); wireUI(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=7').catch(() => {});
+    await openDatabase(); await loadLibrary(); wireUI(); configureMediaSession(); render(); updatePlayerMode(); refreshStorageStatus();
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=8').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
