@@ -7,6 +7,8 @@ const audio = $('#audio');
 let db;
 let tracks = [], playlists = [];
 let currentId = null, currentUrl = null, loadToken = 0, playbackSerial = 0, countedSerial = -1;
+let endedTransitionInFlight = false, cancelPendingAudioReady = null;
+const retiredAudioUrls = new Set();
 let currentView = 'songs', collectionFilter = null, activePlaylistId = null;
 let queue = [], queueIndex = -1, shuffleOn = false, shuffleBag = [], shuffleHistory = [];
 let repeatMode = 'off';
@@ -195,6 +197,59 @@ function updateMediaPosition() {
   if (!navigator.mediaSession?.setPositionState || !Number.isFinite(audio.duration) || audio.duration <= 0) return;
   try { navigator.mediaSession.setPositionState({ duration: audio.duration, position: Math.min(Math.max(audio.currentTime || 0, 0), audio.duration), playbackRate: audio.playbackRate || 1 }); } catch { /* unsupported browser detail */ }
 }
+function trackDebug(track) { return track ? { id: track.id, title: track.title } : null; }
+function audioErrorDebug() { const error = audio.error; return error ? { code: error.code, message: error.message || 'MediaError' } : null; }
+function playbackDebug(stage, details = {}) {
+  console.info(`[Zombie playback] ${stage}`, {
+    previous: details.previous || null, next: details.next || null, queueIndex, queueLength: queue.length, shuffleOn, repeatMode,
+    readyState: audio.readyState, networkState: audio.networkState, paused: audio.paused, ended: audio.ended,
+    currentTime: audio.currentTime, duration: audio.duration, src: audio.currentSrc || audio.src || '', blobLoaded: details.blobLoaded,
+    error: audioErrorDebug(), mediaPlaybackState: navigator.mediaSession?.playbackState || null, ...details,
+  });
+}
+function setMediaPlaybackState(state) { try { if (navigator.mediaSession) navigator.mediaSession.playbackState = state; } catch { /* optional iOS API */ } }
+function retireAudioUrl(url, reason) {
+  if (!url || url === currentUrl) return;
+  retiredAudioUrls.add(url); playbackDebug('object-url-retired', { reason });
+}
+function releaseRetiredAudioUrls(reason) {
+  for (const url of [...retiredAudioUrls]) {
+    if (url === currentUrl || audio.src === url || audio.currentSrc === url) continue;
+    URL.revokeObjectURL(url); retiredAudioUrls.delete(url); playbackDebug('object-url-revoked', { reason });
+  }
+}
+function waitForAudioReady(token, track, expectedUrl) {
+  if (cancelPendingAudioReady) cancelPendingAudioReady();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const isExpectedSource = () => token === loadToken && currentId === track.id && (audio.src === expectedUrl || audio.currentSrc === expectedUrl);
+    const cleanup = () => { audio.removeEventListener('loadeddata', ready); audio.removeEventListener('canplay', ready); audio.removeEventListener('error', failed); if (cancelPendingAudioReady === cancel) cancelPendingAudioReady = null; };
+    const settle = (callback, value) => { if (settled) return; settled = true; cleanup(); callback(value); };
+    const ready = (event) => { if (!isExpectedSource() || audio.readyState < 2) return; playbackDebug('audio-ready', { event: event.type, next: trackDebug(track) }); settle(resolve); };
+    const failed = (event) => { if (!isExpectedSource()) return; const error = new Error(audio.error?.message || `Audio ${event.type} before ready`); error.name = 'AudioLoadError'; playbackDebug('audio-ready-failed', { event: event.type, next: trackDebug(track) }); settle(reject, error); };
+    const cancel = () => { const error = new Error('Audio load superseded'); error.name = 'AbortError'; settle(reject, error); };
+    cancelPendingAudioReady = cancel;
+    audio.addEventListener('loadeddata', ready); audio.addEventListener('canplay', ready); audio.addEventListener('error', failed);
+    queueMicrotask(() => { if (isExpectedSource() && audio.readyState >= 2) ready({ type: 'already-ready' }); });
+  });
+}
+async function requestAudioPlay(track, token = loadToken, reason = 'play') {
+  playbackDebug('play-attempt', { reason, next: trackDebug(track) });
+  try {
+    await audio.play();
+    if (token === loadToken) { playbackDebug('play-resolved', { reason, next: trackDebug(track) }); void updateMediaSession(track); }
+    return true;
+  } catch (error) {
+    playbackDebug('play-rejected', { reason, next: trackDebug(track), playError: { name: error?.name || 'Error', message: error?.message || String(error) } });
+    setMediaPlaybackState('paused');
+    throw error;
+  }
+}
+async function resumeCurrentAudio(reason = 'resume') {
+  const track = tracks.find((entry) => entry.id === currentId); if (!track || !audio.src) return;
+  try { await requestAudioPlay(track, loadToken, reason); }
+  catch { toast('Zombie could not resume this song'); }
+}
 async function updateMediaSession(track = tracks.find((entry) => entry.id === currentId)) {
   if (!track || !('mediaSession' in navigator) || !window.MediaMetadata) return;
   const art = await mediaArtworkFor(track);
@@ -208,8 +263,9 @@ async function updateMediaSession(track = tracks.find((entry) => entry.id === cu
 function configureMediaSession() {
   if (!('mediaSession' in navigator)) return;
   const actions = {
-    play: () => audio.play().catch(() => {}), pause: () => audio.pause(),
-    previoustrack: () => previousTrack(), nexttrack: () => nextTrack(),
+    play: () => { void resumeCurrentAudio('media-session-play'); }, pause: () => audio.pause(),
+    previoustrack: () => { void previousTrack().catch((error) => playbackDebug('media-previous-failed', { actionError: error?.message || String(error) })); },
+    nexttrack: () => { void nextTrack().catch((error) => playbackDebug('media-next-failed', { actionError: error?.message || String(error) })); },
   };
   Object.entries(actions).forEach(([action, handler]) => { try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* action not exposed by this iOS version */ } });
 }
@@ -348,30 +404,55 @@ function renderPlaylistDetail(area) {
   area.append(controls); renderTrackList(area, list, playlist);
 }
 
-async function playTrack(id, sourceIds = null) {
+async function playTrack(id, sourceIds = null, options = {}) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
+  const previousTrack = tracks.find((entry) => entry.id === currentId);
   const resumePosition = id === currentId && !audio.src ? restoredPosition : 0;
+  if (cancelPendingAudioReady) cancelPendingAudioReady();
   const token = ++loadToken;
-  if (sourceIds?.length) { queue = [...new Set(sourceIds)]; queueIndex = queue.indexOf(id); if (shuffleOn) refillShuffleBag(); }
-  else if (!queue.includes(id)) { queue = visibleTracks().map((entry) => entry.id); queueIndex = queue.indexOf(id); if (shuffleOn) refillShuffleBag(); }
-  savePlayerState();
-  if (currentId === id && audio.src) { audio.paused ? audio.play() : audio.pause(); return; }
+  if (sourceIds?.length) {
+    queue = [...new Set(sourceIds)]; queueIndex = queue.indexOf(id);
+    if (shuffleOn) { shuffleBag = randomize(queue.filter((entry) => entry !== id)); shuffleHistory = []; }
+  } else if (!queue.includes(id)) {
+    queue = visibleTracks().map((entry) => entry.id); queueIndex = queue.indexOf(id);
+    if (shuffleOn) refillShuffleBag(id);
+  } else queueIndex = queue.indexOf(id);
+  savePlayerState(true);
+  if (currentId === id && audio.src) {
+    if (audio.paused) {
+      if (audio.ended) audio.currentTime = 0;
+      try { await requestAudioPlay(track, token, options.reason || 'toggle-current'); } catch { toast("This audio file couldn't be played."); }
+    } else audio.pause();
+    return;
+  }
   showMiniPlayer(track); $('#miniPlayer').classList.add('loading'); audio.pause();
-  if (currentUrl) { URL.revokeObjectURL(currentUrl); currentUrl = null; }
+  const oldUrl = currentUrl;
+  playbackDebug('transition-start', { reason: options.reason || 'manual', previous: trackDebug(previousTrack), next: trackDebug(track) });
   try {
     const blob = await getAudioBlob(id);
-    if (token !== loadToken) return;
-    if (!blob) { toast('This song is missing from device storage'); return; }
-    currentUrl = URL.createObjectURL(blob); currentId = id; playbackSerial += 1; audio.src = currentUrl;
+    if (token !== loadToken) { playbackDebug('transition-superseded', { next: trackDebug(track) }); return; }
+    if (!blob) { playbackDebug('blob-missing', { previous: trackDebug(previousTrack), next: trackDebug(track), blobLoaded: false }); toast('This song is missing from device storage'); return; }
+    playbackDebug('blob-loaded', { previous: trackDebug(previousTrack), next: trackDebug(track), blobLoaded: true, blobBytes: blob.size });
+    const nextUrl = URL.createObjectURL(blob);
+    currentUrl = nextUrl; currentId = id; playbackSerial += 1;
+    const ready = waitForAudioReady(token, track, nextUrl);
+    audio.src = nextUrl;
     if (resumePosition > 0) audio.addEventListener('loadedmetadata', () => { audio.currentTime = Math.min(resumePosition, Math.max(0, (audio.duration || resumePosition) - 0.05)); restoredPosition = 0; }, { once: true });
     else restoredPosition = 0;
-    audio.load(); savePlayerState(true);
-    syncNowPlaying(track); render(); updateMediaSession(track);
-    await audio.play();
+    audio.load();
+    retireAudioUrl(oldUrl, 'replacement source attached');
+    playbackDebug('source-attached', { previous: trackDebug(previousTrack), next: trackDebug(track), blobLoaded: true });
+    savePlayerState(true); syncNowPlaying(track); render(); void updateMediaSession(track);
+    await ready;
+    if (token !== loadToken) return;
+    await requestAudioPlay(track, token, options.reason || 'manual');
   } catch (error) {
-    if (token === loadToken) toast("This audio file couldn't be played.");
+    if (token === loadToken && error?.name !== 'AbortError') {
+      playbackDebug('transition-failed', { previous: trackDebug(previousTrack), next: trackDebug(track), transitionError: { name: error?.name || 'Error', message: error?.message || String(error) } });
+      setMediaPlaybackState('paused'); toast("This audio file couldn't be played.");
+    }
   } finally {
-    $('#miniPlayer').classList.remove('loading');
+    if (token === loadToken) $('#miniPlayer').classList.remove('loading');
   }
 }
 function showMiniPlayer(track) { $('#miniPlayer').classList.remove('hidden'); syncNowPlaying(track); }
@@ -385,15 +466,16 @@ function syncNowPlaying(track = tracks.find((entry) => entry.id === currentId)) 
 }
 function togglePlayback() {
   if (!audio.src && currentId) { playTrack(currentId); return; }
-  if (audio.paused) audio.play().catch(() => toast('Tap a song to start playback')); else audio.pause();
+  if (audio.paused) void resumeCurrentAudio('toggle-playback'); else audio.pause();
 }
-function refillShuffleBag() {
-  const options = queue.filter((id) => id !== currentId);
+function refillShuffleBag(excludeId = currentId) {
+  const options = queue.filter((id) => id !== excludeId);
   shuffleBag = randomize(options); shuffleHistory = [];
 }
 async function nextTrack(fromEnd = false) {
   if (!queue.length) return;
-  if (fromEnd && repeatMode === 'one') { audio.currentTime = 0; return audio.play(); }
+  const previousTrack = tracks.find((entry) => entry.id === currentId);
+  if (fromEnd && repeatMode === 'one') { audio.currentTime = 0; playbackDebug('repeat-one', { previous: trackDebug(previousTrack) }); return requestAudioPlay(previousTrack, loadToken, 'repeat-one'); }
   let id;
   if (shuffleOn) {
     if (!shuffleBag.length) refillShuffleBag();
@@ -404,10 +486,17 @@ async function nextTrack(fromEnd = false) {
     else if (repeatMode === 'all') { queueIndex = 0; id = queue[0]; }
     else { audio.pause(); audio.currentTime = 0; if (!fromEnd) toast('You are at the end of this queue'); return; }
   }
-  if (id) await playTrack(id);
+  if (!id) { playbackDebug('next-track-missing', { fromEnd, previous: trackDebug(previousTrack) }); return; }
+  queueIndex = queue.indexOf(id); savePlayerState(true);
+  playbackDebug('next-track-resolved', { fromEnd, previous: trackDebug(previousTrack), next: trackDebug(tracks.find((entry) => entry.id === id)) });
+  await playTrack(id, null, { reason: fromEnd ? 'ended' : 'next' });
 }
 async function advanceAfterEnded() {
-  try { await nextTrack(true); } catch { toast('Zombie could not start the next song'); }
+  if (endedTransitionInFlight) { playbackDebug('ended-ignored-duplicate'); return; }
+  endedTransitionInFlight = true;
+  try { await nextTrack(true); }
+  catch (error) { playbackDebug('ended-transition-failed', { transitionError: { name: error?.name || 'Error', message: error?.message || String(error) } }); toast('Zombie could not start the next song'); }
+  finally { endedTransitionInFlight = false; }
 }
 async function previousTrack() {
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
@@ -643,11 +732,12 @@ function wireUI() {
   $('#sheetClose').onclick = closeSheet; $('#sheet').onclick = (event) => { if (event.target === $('#sheet')) closeSheet(); };
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
   audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#currentTime').textContent = formatTime(audio.currentTime); updateMediaPosition(); savePlayerState(); };
-  audio.onloadedmetadata = () => { $('#duration').textContent = formatTime(audio.duration); updateMediaPosition(); };
-  audio.onplay = () => { $('#miniPlayer').classList.remove('loading'); $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; const track = tracks.find((entry) => entry.id === currentId); if (track && countedSerial !== playbackSerial) { countedSerial = playbackSerial; track.playCount = (track.playCount || 0) + 1; track.lastPlayed = Date.now(); saveRecord('tracks', track).catch(() => {}); } updateMediaSession(track); render(); };
-  audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; savePlayerState(true); render(); };
-  audio.onended = () => { void advanceAfterEnded(); };
-  audio.onerror = () => { $('#miniPlayer').classList.remove('loading'); if (currentId) toast("This audio file couldn't be played."); };
+  audio.onloadedmetadata = () => { $('#duration').textContent = formatTime(audio.duration); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
+  audio.onplay = () => { $('#miniPlayer').classList.remove('loading'); $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; const track = tracks.find((entry) => entry.id === currentId); if (track && countedSerial !== playbackSerial) { countedSerial = playbackSerial; track.playCount = (track.playCount || 0) + 1; track.lastPlayed = Date.now(); saveRecord('tracks', track).catch(() => {}); } releaseRetiredAudioUrls('replacement playing'); playbackDebug('play-event', { next: trackDebug(track) }); updateMediaSession(track); render(); };
+  audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
+  audio.onended = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
+  audio.onerror = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track) }); $('#miniPlayer').classList.remove('loading'); if (!cancelPendingAudioReady && currentId && (audio.src === currentUrl || audio.currentSrc === currentUrl)) { setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); } };
+  ['waiting', 'stalled', 'suspend', 'emptied', 'abort', 'canplay'].forEach((eventName) => audio.addEventListener(eventName, () => playbackDebug(`audio-${eventName}`)));
   let miniTouch = null, fullTouchY = null;
   $('#miniPlayer').addEventListener('touchstart', (event) => { if (event.target.closest('#miniPrevious,#miniPlay,#miniNext')) { miniTouch = null; return; } const touch = event.changedTouches[0]; miniTouch = touch ? { x: touch.clientX, y: touch.clientY, direction: null } : null; }, { passive: true });
   $('#miniPlayer').addEventListener('touchmove', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; if (!miniTouch.direction && Math.max(Math.abs(dx), Math.abs(dy)) > 8) miniTouch.direction = Math.abs(dx) > Math.abs(dy) * 1.25 ? 'horizontal' : 'vertical'; if (miniTouch.direction === 'horizontal') { const offset = Math.max(-30, Math.min(30, dx * 0.22)); $('#miniPlayer').style.transform = `translateX(${offset}px)`; $('#miniPlayer').classList.add('swiping'); } }, { passive: true });
@@ -658,7 +748,7 @@ function wireUI() {
 async function initialise() {
   try {
     await openDatabase(); await loadLibrary(); await restorePlayerState(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#duration').textContent = formatTime(track.duration); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=13').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=14').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
