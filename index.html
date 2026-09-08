@@ -6,9 +6,9 @@
     <meta name="theme-color" content="#11111a" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <link rel="manifest" href="manifest.webmanifest?v=3" />
+    <link rel="manifest" href="manifest.webmanifest?v=5" />
     <link rel="apple-touch-icon" href="icon.svg" />
-    <link rel="stylesheet" href="style.css?v=3" />
+    <link rel="stylesheet" href="style.css?v=5" />
     <title>Zombie</title>
   </head>
   <body>
@@ -16,7 +16,7 @@
       <header>
         <p class="eyebrow">OFFLINE MUSIC VAULT</p>
         <div class="header-row"><h1>Zombie</h1><button id="importButton" class="round-button" aria-label="Add audio">＋</button></div>
-        <input id="fileInput" type="file" accept="audio/*,video/*" multiple hidden />
+        <input id="fileInput" type="file" accept="audio/*,video/*,.mp3,.m4a,.wav,.aac,.flac,.ogg,.opus,.mp4,.mov,.webm" multiple hidden />
         <label class="search"><span>⌕</span><input id="searchInput" type="search" placeholder="Search your library" /></label>
       </header>
 
@@ -32,12 +32,12 @@
     </main>
 
     <footer id="player" class="player hidden">
-      <div class="now-playing"><div class="cover small-cover">♫</div><div><strong id="nowTitle">Nothing playing</strong><span id="nowArtist">Choose a file to begin</span></div></div>
-      <div class="controls"><button id="backButton" aria-label="Go back 10 seconds">↺<small>10</small></button><button id="playButton" class="play-button" aria-label="Play">▶</button><button id="forwardButton" aria-label="Skip ahead 10 seconds">↻<small>10</small></button></div>
+      <div class="now-playing"><div id="nowCover" class="cover small-cover">🧟</div><div><strong id="nowTitle">Nothing playing</strong><span id="nowArtist">Choose a file to begin</span></div></div>
+      <div class="controls"><button id="shuffleButton" aria-label="Shuffle">⇄</button><button id="previousButton" aria-label="Previous track">|◀</button><button id="backButton" aria-label="Go back 10 seconds">↺<small>10</small></button><button id="playButton" class="play-button" aria-label="Play">▶</button><button id="forwardButton" aria-label="Skip ahead 10 seconds">↻<small>10</small></button><button id="nextButton" aria-label="Next track">▶|</button><button id="repeatButton" aria-label="Repeat off">↻</button></div>
       <div class="timeline"><span id="currentTime">0:00</span><input id="seekBar" type="range" min="0" max="100" value="0" aria-label="Playback position" /><span id="duration">0:00</span></div>
       <audio id="audio"></audio>
     </footer>
     <div id="toast" class="toast" role="status"></div>
-    <script src="app.js?v=3"></script>
+    <script src="app.js?v=5"></script>
   </body>
 </html>
