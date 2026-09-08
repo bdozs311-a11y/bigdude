@@ -9,13 +9,13 @@
     <link rel="manifest" href="manifest.webmanifest" />
     <link rel="apple-touch-icon" href="icon.svg" />
     <link rel="stylesheet" href="style.css" />
-    <title>My Sound Library</title>
+    <title>Zombie</title>
   </head>
   <body>
     <main class="app-shell">
       <header>
-        <p class="eyebrow">OFFLINE LIBRARY</p>
-        <div class="header-row"><h1>My Sounds</h1><button id="importButton" class="round-button" aria-label="Add audio">＋</button></div>
+        <p class="eyebrow">OFFLINE MUSIC VAULT</p>
+        <div class="header-row"><h1>Zombie</h1><button id="importButton" class="round-button" aria-label="Add audio">＋</button></div>
         <input id="fileInput" type="file" accept="audio/*,video/*" multiple hidden />
         <label class="search"><span>⌕</span><input id="searchInput" type="search" placeholder="Search your library" /></label>
       </header>
@@ -28,7 +28,7 @@
 
       <section class="library-heading"><h2>Library</h2><span id="libraryCount">0 tracks</span></section>
       <section id="trackList" class="track-list" aria-live="polite"></section>
-      <section id="emptyState" class="empty-state"><div>♪</div><h2>Your library is waiting</h2><p>Import an MP3, M4A, WAV, or a screen recording to play it here offline.</p></section>
+      <section id="emptyState" class="empty-state"><div>☠</div><h2>Wake up your library</h2><p>Import an MP3, M4A, WAV, or a screen recording to keep it here offline.</p></section>
     </main>
 
     <footer id="player" class="player hidden">
