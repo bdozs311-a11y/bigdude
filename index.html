@@ -7,9 +7,12 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Zombie" />
-    <link rel="manifest" href="manifest.webmanifest?v=6" />
+    <link rel="manifest" href="manifest.webmanifest?v=7" />
     <link rel="apple-touch-icon" href="icon.svg" />
-    <link rel="stylesheet" href="style.css?v=6" />
+    <link rel="stylesheet" href="style.css?v=7" />
+    <style>
+      .cover,.collection-art,.mini-art,.large-art{background-size:cover;background-position:center;overflow:hidden}.cover.has-art,.collection-art.has-art,.mini-art.has-art,.large-art.has-art{color:transparent}.art-0{background-image:radial-gradient(circle at 20% 20%,#4f4f4f,#090909 63%)}.art-1{background-image:linear-gradient(135deg,#1b1b1b,#5b5b5b 48%,#080808)}.art-2{background-image:radial-gradient(circle at 80% 25%,#666,#121212 55%,#000)}.art-3{background-image:linear-gradient(45deg,#070707,#3c3c3c,#111)}.art-4{background-image:radial-gradient(circle at 50% 75%,#4d4d4d,#080808 62%)}.art-5{background-image:linear-gradient(155deg,#3e3e3e,#101010 42%,#252525)}.title-emoji{font-style:normal;font-size:12px;margin-right:5px}.track-copy em{font-style:normal;color:#d8d8d8}.song-details{display:grid;grid-template-columns:82px 1fr;gap:8px;margin:0 0 13px;font-size:13px}.song-details dt{color:#aaa}.song-details dd{margin:0;overflow-wrap:anywhere}.edit-field{display:grid;gap:5px;margin:10px 0;color:#bdbdbd;font-size:12px}.edit-field input{border:1px solid #4b4b4b;border-radius:10px;padding:11px;background:#151515;color:#fff;font:inherit}.track.active{box-shadow:0 0 0 1px #bdbdbd,0 0 22px #ffffff18}.mini-art,.large-art,.collection-art,.cover{transition:transform .2s ease,box-shadow .2s ease}.track.active .cover{transform:scale(1.03);box-shadow:0 0 15px #ffffff42}.play-button,.mini-play,.favorite{transition:transform .15s ease}.play-button:active,.mini-play:active,.favorite:active{transform:scale(.88)}.playlist-collage{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:1px;background:#050505}.playlist-collage i{display:grid;place-items:center;min-width:0;background-size:cover;background-position:center;font-style:normal;font-size:10px;color:#fff}.playlist-collage i:only-child{grid-column:1/3;grid-row:1/3}
+    </style>
     <title>Zombie</title>
   </head>
   <body>
@@ -28,9 +31,12 @@
         <nav class="library-tabs" aria-label="Library sections">
           <button class="tab active" data-view="songs">Songs</button>
           <button class="tab" data-view="recent">Recent</button>
+          <button class="tab" data-view="played">Played</button>
+          <button class="tab" data-view="most">Top</button>
           <button class="tab" data-view="favorites">Favorites</button>
           <button class="tab" data-view="albums">Albums</button>
           <button class="tab" data-view="artists">Artists</button>
+          <button class="tab" data-view="genres">Genres</button>
           <button class="tab" data-view="playlists">Playlists</button>
         </nav>
         <section id="importArea" class="import-area">
@@ -40,7 +46,7 @@
         </section>
         <section class="library-toolbar">
           <p id="librarySummary">0 songs</p>
-          <label class="sort-label">Sort <select id="sortSelect"><option value="recent">Recently added</option><option value="title">Title</option><option value="artist">Artist</option><option value="album">Album</option></select></label>
+          <label class="sort-label">Sort <select id="sortSelect"><option value="recent">Recently added</option><option value="oldest">Oldest added</option><option value="title">Song name A-Z</option><option value="artist">Artist A-Z</option><option value="album">Album</option><option value="plays">Most played</option><option value="played">Recently played</option></select></label>
         </section>
         <section id="contentArea" class="content-area" aria-live="polite"></section>
         <section id="emptyState" class="empty-state"><div>☠</div><h2>Wake up your library</h2><p>Import audio once, then listen from Zombie even without internet.</p></section>
@@ -77,6 +83,7 @@
     <section id="importProgress" class="progress-overlay hidden" role="status"><div><div class="spinner"></div><strong id="progressTitle">Saving music…</strong><span id="progressDetail">Please keep Zombie open</span></div></section>
     <div id="toast" class="toast" role="status"></div>
     <audio id="audio" preload="metadata"></audio>
-    <script src="app.js?v=6"></script>
+    <input id="artInput" type="file" accept="image/*" hidden />
+    <script src="app.js?v=7"></script>
   </body>
 </html>
