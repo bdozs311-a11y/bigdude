@@ -13,6 +13,7 @@ let repeatMode = 'off';
 let artTarget = null;
 const artworkUrls = new Map();
 let panelTimer = null;
+let restoredPosition = 0, lastStateSaveAt = 0;
 
 const randomEmoji = () => EMOJIS[Math.floor(Math.random() * EMOJIS.length)];
 const formatTime = (seconds) => !Number.isFinite(seconds) ? '0:00' : `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
@@ -72,9 +73,10 @@ function getRecord(name, key) {
 function saveRecord(name, record) {
   return new Promise((resolve, reject) => { const request = store(name, 'readwrite').put(record); request.onsuccess = resolve; request.onerror = () => reject(request.error); });
 }
-function savePlayerState() {
+function savePlayerState(force = false) {
   if (!db) return;
-  const state = { key: 'playerState', currentId, queue, queueIndex, shuffleOn, repeatMode, volume: audio.volume };
+  const now = Date.now(); if (!force && now - lastStateSaveAt < 3500) return; lastStateSaveAt = now;
+  const state = { key: 'playerState', currentId, queue, queueIndex, shuffleOn, shuffleBag, shuffleHistory, repeatMode, volume: audio.volume, position: Number.isFinite(audio.currentTime) ? audio.currentTime : restoredPosition };
   saveRecord('settings', state).catch(() => {});
 }
 async function restorePlayerState() {
@@ -82,8 +84,12 @@ async function restorePlayerState() {
   if (!state) return;
   queue = Array.isArray(state.queue) ? state.queue.filter((id) => tracks.some((track) => track.id === id)) : [];
   currentId = tracks.some((track) => track.id === state.currentId) ? state.currentId : null;
-  queueIndex = Math.max(0, queue.indexOf(currentId));
+  const savedIndex = Number.isInteger(state.queueIndex) ? state.queueIndex : -1;
+  queueIndex = queue[savedIndex] === currentId ? savedIndex : Math.max(0, queue.indexOf(currentId));
   shuffleOn = Boolean(state.shuffleOn); repeatMode = ['off', 'all', 'one'].includes(state.repeatMode) ? state.repeatMode : 'off';
+  shuffleBag = Array.isArray(state.shuffleBag) ? state.shuffleBag.filter((id) => queue.includes(id)) : [];
+  shuffleHistory = Array.isArray(state.shuffleHistory) ? state.shuffleHistory.filter((id) => queue.includes(id)) : [];
+  restoredPosition = Number.isFinite(state.position) && state.position > 0 ? state.position : 0;
   audio.volume = Number.isFinite(state.volume) ? Math.min(1, Math.max(0, state.volume)) : 1;
 }
 function deleteRecord(name, key) {
@@ -279,6 +285,7 @@ function renderPlaylistDetail(area) {
 
 async function playTrack(id, sourceIds = null) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
+  const resumePosition = id === currentId && !audio.src ? restoredPosition : 0;
   const token = ++loadToken;
   if (sourceIds?.length) { queue = [...new Set(sourceIds)]; queueIndex = queue.indexOf(id); if (shuffleOn) refillShuffleBag(); }
   else if (!queue.includes(id)) { queue = visibleTracks().map((entry) => entry.id); queueIndex = queue.indexOf(id); if (shuffleOn) refillShuffleBag(); }
@@ -290,7 +297,10 @@ async function playTrack(id, sourceIds = null) {
     const blob = await getAudioBlob(id);
     if (token !== loadToken) return;
     if (!blob) { toast('This song is missing from device storage'); return; }
-    currentUrl = URL.createObjectURL(blob); currentId = id; playbackSerial += 1; audio.src = currentUrl; audio.load(); savePlayerState();
+    currentUrl = URL.createObjectURL(blob); currentId = id; playbackSerial += 1; audio.src = currentUrl;
+    if (resumePosition > 0) audio.addEventListener('loadedmetadata', () => { audio.currentTime = Math.min(resumePosition, Math.max(0, (audio.duration || resumePosition) - 0.05)); restoredPosition = 0; }, { once: true });
+    else restoredPosition = 0;
+    audio.load(); savePlayerState(true);
     syncNowPlaying(track); render(); updateMediaSession(track);
     await audio.play();
   } catch (error) {
@@ -347,7 +357,7 @@ function updatePlayerMode() {
   $('#repeatButton').classList.toggle('mode-active', repeatMode !== 'off');
   $('#repeatButton').textContent = repeatMode === 'one' ? '↻¹' : '↻';
   $('#repeatButton').setAttribute('aria-label', `Repeat ${repeatMode}`);
-  savePlayerState();
+  savePlayerState(true);
 }
 function openNowPlaying() {
   if (!currentId) return;
@@ -553,15 +563,15 @@ function wireUI() {
   $('#playButton').onclick = togglePlayback; $('#nextButton').onclick = () => nextTrack(); $('#previousButton').onclick = previousTrack;
   $('#shuffleButton').onclick = () => { shuffleOn = !shuffleOn; if (shuffleOn) refillShuffleBag(); updatePlayerMode(); toast(shuffleOn ? 'Shuffle on' : 'Shuffle off'); };
   $('#repeatButton').onclick = () => { repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off'; updatePlayerMode(); toast(`Repeat ${repeatMode}`); };
-  $('#npSeek').oninput = (event) => { if (audio.duration) audio.currentTime = (event.target.value / 100) * audio.duration; };
-  $('#volumeControl').oninput = (event) => { audio.volume = Number(event.target.value); savePlayerState(); };
+  $('#npSeek').oninput = (event) => { if (audio.duration) { audio.currentTime = (event.target.value / 100) * audio.duration; savePlayerState(true); } };
+  $('#volumeControl').oninput = (event) => { audio.volume = Number(event.target.value); savePlayerState(true); };
   $('#npFavorite').onclick = () => currentId && toggleFavorite(currentId); $('#npMore').onclick = () => currentId && openSongOptions(currentId); $('#queueButton').onclick = openQueue;
   $('#sheetClose').onclick = closeSheet; $('#sheet').onclick = (event) => { if (event.target === $('#sheet')) closeSheet(); };
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
-  audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#currentTime').textContent = formatTime(audio.currentTime); updateMediaPosition(); };
+  audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#currentTime').textContent = formatTime(audio.currentTime); updateMediaPosition(); savePlayerState(); };
   audio.onloadedmetadata = () => { $('#duration').textContent = formatTime(audio.duration); updateMediaPosition(); };
   audio.onplay = () => { $('#miniPlayer').classList.remove('loading'); $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; const track = tracks.find((entry) => entry.id === currentId); if (track && countedSerial !== playbackSerial) { countedSerial = playbackSerial; track.playCount = (track.playCount || 0) + 1; track.lastPlayed = Date.now(); saveRecord('tracks', track).catch(() => {}); } updateMediaSession(track); render(); };
-  audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; render(); };
+  audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; savePlayerState(true); render(); };
   audio.onended = () => { void advanceAfterEnded(); };
   audio.onerror = () => { $('#miniPlayer').classList.remove('loading'); if (currentId) toast("This audio file couldn't be played."); };
   let miniTouch = null, fullTouchY = null;
@@ -573,12 +583,13 @@ function wireUI() {
 }
 async function initialise() {
   try {
-    await openDatabase(); await loadLibrary(); await restorePlayerState(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) showMiniPlayer(tracks.find((track) => track.id === currentId)); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=10').catch(() => {});
+    await openDatabase(); await loadLibrary(); await restorePlayerState(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#duration').textContent = formatTime(track.duration); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=11').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
   }
 }
 initialise();
-window.addEventListener('pagehide', () => artworkUrls.forEach((url) => URL.revokeObjectURL(url)));
+window.addEventListener('pagehide', () => { savePlayerState(true); artworkUrls.forEach((url) => URL.revokeObjectURL(url)); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') savePlayerState(true); });
