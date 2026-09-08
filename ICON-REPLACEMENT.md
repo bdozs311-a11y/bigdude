@@ -6,4 +6,4 @@ Zombie uses the supplied black-and-white circular icon in these PNG files:
 - `zombie-icon-192.png` — 192 × 192 for the PWA manifest.
 - `zombie-icon-512.png` — 512 × 512 for the high-resolution PWA icon and media artwork fallback.
 
-The original source image is preserved as `icon.png`. The older `icon.svg` is no longer referenced.
+The original full-size source image is preserved as `icon.png`. The active PWA files use a centered 82% safe area so the mark has the same visual breathing room as a standard Home Screen music-app icon. The older `icon.svg` is no longer referenced.
