@@ -751,6 +751,14 @@ function visibleTracks() {
   }
   return list;
 }
+function showEmptyState({ icon = '☠', title = 'Your library is waiting', message = 'Import music once, then keep listening offline.', action = null } = {}) {
+  const state = $('#emptyState');
+  state.style.display = 'block';
+  state.innerHTML = `<div>${icon}</div><h2>${escapeHTML(title)}</h2><p>${escapeHTML(message)}</p>${action ? `<button class="empty-action">${escapeHTML(action.label)}</button>` : ''}`;
+  const emptyAction = state.querySelector('.empty-action');
+  if (emptyAction && action?.onClick) emptyAction.addEventListener('click', action.onClick);
+}
+function hideEmptyState() { $('#emptyState').style.display = 'none'; }
 function render() {
   $('#screenTitle').textContent = activePlaylistId ? (playlists.find((playlist) => playlist.id === activePlaylistId)?.name || 'Playlist') : (collectionFilter?.value || 'Zombie');
   $('#libraryScreen').classList.toggle('hidden', currentView === 'settings');
@@ -760,6 +768,7 @@ function render() {
   if (currentView === 'settings') { refreshStorageStatus(); return; }
   const area = $('#contentArea'); area.className = `content-area layout-${preferences.layout}`; area.innerHTML = '';
   $('#importArea').classList.toggle('hidden', currentView !== 'songs' || Boolean(collectionFilter) || Boolean(activePlaylistId));
+  $('#importArea').classList.toggle('library-populated', tracks.length > 0);
   $('#sortSelect').parentElement.classList.toggle('hidden', ['albums', 'artists', 'playlists'].includes(currentView) || Boolean(activePlaylistId));
   if (activePlaylistId) renderPlaylistDetail(area);
   else if (currentView === 'albums') renderCollections(area, 'album');
@@ -800,7 +809,7 @@ function renderHomeShelves(area) {
 }
 function renderTrackList(area, list, playlist = null) {
   $('#librarySummary').textContent = libraryStats(list);
-  $('#emptyState').style.display = list.length || ['albums', 'artists', 'playlists'].includes(currentView) ? 'none' : 'block';
+  if (list.length) hideEmptyState();
   if (collectionFilter && !playlist) {
     const context = document.createElement('article'); context.className = 'collection-context';
     const albums = new Set(list.map((track) => track.album || 'Single')).size;
@@ -808,7 +817,14 @@ function renderTrackList(area, list, playlist = null) {
     area.append(context);
   }
   if (!list.length) {
-    area.innerHTML = currentView === 'favorites' ? '<div class="inline-empty">No favorites yet. Tap ♡ on a song to save it here.</div>' : playlist ? '<div class="inline-empty">This playlist is empty. Add songs from your library.</div>' : '';
+    if (playlist) {
+      hideEmptyState();
+      area.insertAdjacentHTML('beforeend', '<div class="inline-empty">This playlist is empty. Add songs from your library.</div>');
+    } else if (currentView === 'favorites') showEmptyState({ icon: '♡', title: 'No favorites yet', message: 'Tap the heart on any song to keep it close.' });
+    else if (currentView === 'played') showEmptyState({ icon: '◷', title: 'Nothing played yet', message: 'Your recently played songs will appear here.' });
+    else if (currentView === 'most') showEmptyState({ icon: '↗', title: 'Your top songs will grow here', message: 'Play your local music and Zombie will keep the count on this device.' });
+    else if (currentView === 'recent') showEmptyState({ icon: '♫', title: 'No recent imports', message: 'Add music to build your local library.', action: { label: 'Import music', onClick: () => $('#fileInput').click() } });
+    else showEmptyState({ icon: '🧟', title: 'Your library is waiting', message: 'Import music once, then listen offline whenever you want.', action: { label: 'Import music', onClick: () => $('#fileInput').click() } });
     return;
   }
   list.forEach((track, position) => {
@@ -833,7 +849,8 @@ function renderCollections(area, type) {
   tracks.forEach((track) => { const group = groups.get(track[key]) || []; group.push(track); groups.set(track[key], group); });
   const entries = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
   $('#librarySummary').textContent = `${entries.length} ${type}${entries.length === 1 ? '' : 's'}`;
-  $('#emptyState').style.display = entries.length ? 'none' : 'block';
+  if (entries.length) hideEmptyState();
+  else showEmptyState({ icon: type === 'album' ? '▣' : type === 'artist' ? '♙' : '⌁', title: `No ${type}s yet`, message: 'Add music with metadata and Zombie will organize it here.' });
   entries.forEach(([name, group]) => {
     const card = document.createElement('button'); card.className = 'collection-card';
     card.innerHTML = `<span class="collection-art art-${artVariant(group[0])}" data-art="${group[0].id}">Z</span><span><strong>${escapeHTML(name || 'Other')}</strong><small>${group.length} ${group.length === 1 ? 'song' : 'songs'}${type === 'album' ? ` · ${escapeHTML(group[0].artist)}` : ''}</small></span><b>›</b>`;
@@ -844,7 +861,8 @@ function renderCollections(area, type) {
 function renderPlaylists(area) {
   const search = $('#searchInput').value.trim().toLowerCase(); const shownPlaylists = search ? playlists.filter((playlist) => playlist.name.toLowerCase().includes(search)) : playlists;
   $('#librarySummary').textContent = `${shownPlaylists.length} ${shownPlaylists.length === 1 ? 'playlist' : 'playlists'}`;
-  $('#emptyState').style.display = shownPlaylists.length ? 'none' : 'block';
+  if (shownPlaylists.length) hideEmptyState();
+  else showEmptyState({ icon: '☷', title: 'Create your first playlist', message: 'Build a local queue you can keep listening to offline.' });
   const create = document.createElement('button'); create.className = 'create-playlist'; create.textContent = '+ Create playlist'; create.onclick = createPlaylist; area.append(create);
   shownPlaylists.forEach((playlist) => {
     const card = document.createElement('article'); card.className = 'playlist-card';
@@ -1505,7 +1523,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=29').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=30').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');

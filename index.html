@@ -7,9 +7,9 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Zombie" />
-    <link rel="manifest" href="manifest.webmanifest?v=29" />
+    <link rel="manifest" href="manifest.webmanifest?v=30" />
     <link rel="apple-touch-icon" href="zombie-icon-180.png?v=15" />
-    <link rel="stylesheet" href="style.css?v=29" />
+    <link rel="stylesheet" href="style.css?v=30" />
     <style>
       .cover,.collection-art,.mini-art,.large-art{background-size:cover;background-position:center;overflow:hidden;position:relative}.cover.has-art,.collection-art.has-art,.mini-art.has-art,.large-art.has-art{color:transparent}.art-0{background-image:radial-gradient(circle at 20% 20%,#777 0 2%,#202020 24%,#050505 70%),linear-gradient(125deg,#111,#444)}.art-1{background-image:linear-gradient(135deg,#111,#666 48%,#080808),repeating-linear-gradient(90deg,transparent 0 12px,#ffffff0b 12px 13px)}.art-2{background-image:radial-gradient(circle at 80% 25%,#949494 0 3%,#252525 30%,#000 74%)}.art-3{background-image:linear-gradient(45deg,#050505,#4b4b4b,#111),repeating-linear-gradient(0deg,transparent 0 7px,#ffffff0b 7px 8px)}.art-4{background-image:radial-gradient(circle at 50% 75%,#737373 0 2%,#191919 35%,#050505 76%)}.art-5{background-image:linear-gradient(155deg,#656565,#101010 42%,#3d3d3d)}.title-emoji{font-style:normal;font-size:12px;margin-right:5px}.track-copy em{font-style:normal;color:#d8d8d8}.song-details{display:grid;grid-template-columns:82px 1fr;gap:8px;margin:0 0 13px;font-size:13px}.song-details dt{color:#aaa}.song-details dd{margin:0;overflow-wrap:anywhere}.edit-field{display:grid;gap:5px;margin:10px 0;color:#bdbdbd;font-size:12px}.edit-field input{border:1px solid #4b4b4b;border-radius:10px;padding:11px;background:#151515;color:#fff;font:inherit}.track.active{box-shadow:0 0 0 1px #bdbdbd,0 0 22px #ffffff18}.mini-art,.large-art,.collection-art,.cover{transition:transform .2s ease,box-shadow .2s ease}.track.active .cover{transform:scale(1.03);box-shadow:0 0 15px #ffffff42}.play-button,.mini-play,.favorite{transition:transform .15s ease}.play-button:active,.mini-play:active,.favorite:active{transform:scale(.88)}.playlist-collage{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:1px;background:#050505}.playlist-collage i{display:grid;place-items:center;min-width:0;background-size:cover;background-position:center;font-style:normal;font-size:10px;color:#fff}.playlist-collage i:only-child{grid-column:1/3;grid-row:1/3}.playing-bars{display:inline-flex;align-items:end;gap:2px;height:12px;margin-left:7px;vertical-align:middle}.playing-bars i{display:block;width:2px;height:5px;background:#fff;animation:zombieBars .75s ease-in-out infinite alternate}.playing-bars i:nth-child(2){height:10px;animation-delay:-.38s}.playing-bars i:nth-child(3){height:7px;animation-delay:-.18s}@keyframes zombieBars{to{height:12px}}.now-playing-screen{transition:opacity .22s ease,transform .22s ease;padding-bottom:calc(env(safe-area-inset-bottom) + 28px)}.now-playing-screen:not(.hidden){display:flex;flex-direction:column;justify-content:space-evenly}.mini-player{transition:transform .22s ease,box-shadow .22s ease;touch-action:pan-y}.mini-player:active{transform:scale(.99)}.np-song h2{display:flex;align-items:center;gap:8px}.np-song h2 i{font-style:normal;font-size:18px}.player-controls{margin:8px 0}.player-controls button:nth-child(2),.player-controls button:nth-child(3),.player-controls button:nth-child(4){transform:scale(1.13)}.queue-button{display:block;margin:12px auto 0;border:1px solid #4e4e4e;border-radius:999px;padding:9px 15px;background:#191919;color:#fff;font:600 13px system-ui}.queue-item{display:flex;gap:11px;align-items:center;text-align:left}.queue-item small{display:block;margin-top:3px;color:#aaa}.queue-current{outline:1px solid #777}
     </style>
@@ -156,16 +156,22 @@
       @media(max-width:390px){.home-song-card,.home-song-card>span:last-child{flex-basis:126px;min-width:126px;width:126px}.home-song-card .cover{width:126px;height:126px}.home-card-row{gap:13px}}
       @media(prefers-reduced-motion:reduce){.home-card-row{scroll-behavior:auto}.home-song-card .cover{transition:none!important}}
     </style>
+    <style>
+      /* v30: tighter library rhythm and clearer mobile navigation without changing playback. */
+      .app-shell{padding-top:calc(18px + env(safe-area-inset-top));padding-bottom:calc(150px + env(safe-area-inset-bottom))}.topbar{min-height:48px;margin-bottom:2px}.topbar h1{font-size:32px;letter-spacing:-1.15px}.round-button{width:44px;height:44px;box-shadow:0 8px 18px #0005}.search{margin:15px 0 12px}.library-tabs{gap:7px;padding-bottom:9px;margin-bottom:1px}.tab{position:relative;min-height:39px;padding:8px 12px;border-color:#ffffff13;background:#15161bd9}.tab.active{border-color:rgba(var(--zombie-accent-rgb),.75);background:rgba(var(--zombie-accent-rgb),.2);box-shadow:inset 0 0 0 1px rgba(var(--zombie-accent-rgb),.24),0 6px 17px rgba(var(--zombie-accent-rgb),.12)}.tab.active::after{content:'';position:absolute;left:50%;bottom:4px;width:16px;height:2px;border-radius:99px;background:var(--zombie-accent);transform:translateX(-50%);box-shadow:0 0 8px rgba(var(--zombie-accent-rgb),.9)}
+      .import-area{margin:0 0 14px}.import-area.library-populated{min-height:0;margin:1px 0 10px;padding:8px 10px;border-style:solid;border-color:#ffffff10;border-radius:15px;background:linear-gradient(100deg,rgba(var(--zombie-accent-rgb),.12),#15161bdb)}.import-area.library-populated .import-icon{width:35px;height:35px;border-radius:10px;font-size:18px}.import-area.library-populated p{display:none}.import-area.library-populated strong{font-size:13px}.import-area.library-populated .secondary-button{padding:8px 10px;font-size:12px}.library-toolbar{margin-bottom:6px}.content-area{gap:5px}
+      .empty-state{margin:12px 0 0;padding:38px 22px;border:1px dashed #ffffff1b;border-radius:22px;background:linear-gradient(145deg,#15161cbe,#0d0e12c9)}.empty-state>div{font-size:36px}.empty-state h2{font-size:19px}.empty-state p{max-width:260px;margin:auto}.empty-state .empty-action{display:inline-flex;margin-top:16px;padding:10px 13px;border:0;border-radius:999px;background:linear-gradient(135deg,#fff,rgba(var(--zombie-accent-rgb),.82));color:#08080b;font:800 12px system-ui}
+      .mini-player{min-height:60px;bottom:calc(66px + env(safe-area-inset-bottom));padding-top:8px;padding-bottom:8px;gap:6px}.mini-art{width:40px;height:40px}.mini-track{gap:9px;min-height:43px}.mini-track strong{font-size:13px;line-height:1.15}.mini-track small{margin-top:2px}.mini-player>button:not(.mini-track){min-width:36px;min-height:36px}.mini-play{width:36px;height:36px}.mini-track:active .mini-art{transform:scale(.96)}
+      .cover,.collection-art,.playlist-collage,.mini-art,.large-art{background-color:#1d1e25}.track .cover{width:52px;height:52px}.collection-art,.playlist-open>span:first-child{width:54px;height:54px}.track{min-height:70px;padding-block:8px}.home-shelf-heading{margin-bottom:8px}.home-card-row{padding-bottom:12px}.home-song-card{flex-basis:136px;min-width:136px}.home-song-card .cover{width:136px;height:136px}.home-song-card>span:last-child{width:136px}.home-song-card strong{font-size:12px}.home-song-card small{font-size:11px}
+      @media(max-width:390px){.app-shell{padding-bottom:calc(143px + env(safe-area-inset-bottom))}.topbar h1{font-size:30px}.home-song-card,.home-song-card>span:last-child{flex-basis:123px;min-width:123px;width:123px}.home-song-card .cover{width:123px;height:123px}.import-area.library-populated .secondary-button{display:block}.mini-player>button:not(.mini-track){min-width:33px}}
+    </style>
     <title>Zombie</title>
   </head>
   <body>
     <div id="ambientTransition" aria-hidden="true"></div>
     <main class="app-shell">
       <header class="topbar">
-        <div>
-          <p class="eyebrow">YOUR OFFLINE MUSIC</p>
-          <h1 id="screenTitle">Zombie</h1>
-        </div>
+        <div><h1 id="screenTitle">Zombie</h1></div>
         <button id="importButton" class="round-button" aria-label="Add audio">＋</button>
         <input id="fileInput" type="file" accept="audio/*,video/*,.mp3,.m4a,.wav,.aac,.flac,.ogg,.opus,.mp4,.mov,.webm" multiple hidden />
       </header>
@@ -251,6 +257,6 @@
     <input id="lyricsInput" type="file" accept=".lrc,.txt,text/plain,text/*,application/octet-stream,*/*" hidden />
     <input id="visualInput" type="file" accept="video/mp4,video/webm,video/quicktime,.mp4,.webm,.mov" hidden />
     <input id="backupInput" type="file" accept=".zombie,.json,application/json" hidden />
-    <script src="app.js?v=29"></script>
+    <script src="app.js?v=30"></script>
   </body>
 </html>
