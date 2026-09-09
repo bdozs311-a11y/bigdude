@@ -320,6 +320,8 @@ async function importLyricsFile(file) {
   if (!file || !id) return;
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   try {
+    const fileName = String(file.name || '').toLowerCase();
+    if (!/\.(lrc|txt)$/.test(fileName) && !/^text\//i.test(file.type || '')) throw new Error('Choose an .lrc or .txt lyrics file');
     if (file.size > 750 * 1024) throw new Error('Lyrics file is too large');
     const value = await file.text(); const syncedLyrics = parseLrc(value); track.syncedLyrics = syncedLyrics; track.lyrics = syncedLyrics.length ? '' : value.trim(); await saveRecord('tracks', track);
     closeSheet(); if (activeLyricsId === id) renderLyrics(track); toast(syncedLyrics.length ? 'Synced LRC lyrics imported' : 'Lyrics imported offline');
@@ -1211,7 +1213,7 @@ function wireUI() {
 async function initialise() {
   try {
     await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=22').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=23').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
