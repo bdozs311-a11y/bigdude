@@ -5,7 +5,7 @@ const EMOJIS = ['🧟', '🧟‍♀️', '🦇', '🕸️', '🖤', '🪦', '�
 const SUPPORTED_FILES = /\.(mp3|m4a|wav|aac|flac|ogg|opus|mp4|mov|webm)$/i;
 const audio = $('#audio');
 let db;
-let tracks = [], playlists = [];
+let tracks = [], playlists = [], playlistFolders = [];
 let currentId = null, currentUrl = null, loadToken = 0, playbackSerial = 0, countedSerial = -1;
 let endedTransitionInFlight = false, pendingAudio = null, preparedNext = null, preloadToken = 0;
 let pausedResumeSnapshot = null, mediaResumeAttempt = 0;
@@ -19,6 +19,7 @@ let lyricsSyncDraft = null, lyricsManualScrollUntil = 0, lyricsAutoScrollUntil =
 const artworkUrls = new Map();
 const visualUrls = new Map();
 let panelTimer = null, lastVisualTrackId = null, visualTransitionToken = 0, activePaletteSignature = '';
+let sleepTimerHandle = null, sleepTimerEndsAt = 0, playlistDragTrackId = null;
 let restoredPosition = 0, lastStateSaveAt = 0;
 let pendingBackup = null;
 const BACKUP_FORMAT = 'zombie-backup';
@@ -99,6 +100,18 @@ function setMarqueeText(selector, value) {
     const distance = Math.max(0, copy.scrollWidth - element.clientWidth);
     if (distance > 4) { element.style.setProperty('--marquee-distance', `-${distance}px`); element.classList.add('marquee-active'); }
   });
+}
+function buildDecorativeWaveform() {
+  const muted = $('#waveformMuted'), played = $('#waveformPlayed'); if (!muted || !played || muted.childElementCount) return;
+  const bars = Array.from({ length: 58 }, (_, index) => {
+    const height = 28 + ((index * 37 + index * index * 9 + 17) % 66);
+    return `<i style="--wave-height:${height}%"></i>`;
+  }).join('');
+  muted.innerHTML = bars; played.innerHTML = bars;
+}
+function setWaveformProgress(percent) {
+  const value = Math.max(0, Math.min(100, Number(percent) || 0));
+  $('#waveformShell')?.style.setProperty('--seek-progress', `${value}%`);
 }
 function syncAmbientMotionState() {
   const playing = !audio.paused;
@@ -195,6 +208,7 @@ async function restorePlayerState() {
   shuffleOn = Boolean(state.shuffleOn); repeatMode = ['off', 'all', 'one'].includes(state.repeatMode) ? state.repeatMode : 'off';
   shuffleBag = Array.isArray(state.shuffleBag) ? state.shuffleBag.filter((id) => queue.includes(id)) : [];
   shuffleHistory = Array.isArray(state.shuffleHistory) ? state.shuffleHistory.filter((id) => queue.includes(id)) : [];
+  reconcileShuffleState('restore');
   restoredPosition = Number.isFinite(state.position) && state.position > 0 ? state.position : 0;
   audio.volume = Number.isFinite(state.volume) ? Math.min(1, Math.max(0, state.volume)) : 1;
 }
@@ -711,7 +725,9 @@ function randomize(values) {
 }
 
 async function loadLibrary() {
-  [tracks, playlists] = await Promise.all([readAll('tracks'), readAll('playlists')]);
+  const loaded = await Promise.all([readAll('tracks'), readAll('playlists'), getRecord('settings', 'playlistFolders').catch(() => null)]);
+  [tracks, playlists] = loaded;
+  playlistFolders = Array.isArray(loaded[2]?.folders) ? loaded[2].folders.filter((folder) => folder?.id && folder?.name).map((folder) => ({ id: String(folder.id), name: String(folder.name).slice(0, 80), createdAt: Number(folder.createdAt) || Date.now() })) : [];
   tracks = tracks.map((track) => ({
     ...track,
     title: track.title || track.name || 'Untitled song',
@@ -842,6 +858,15 @@ function renderTrackList(area, list, playlist = null) {
       down.onclick = () => reorderPlaylist(playlist.id, position, position + 1);
       removeButton.onclick = () => removeFromPlaylist(playlist.id, track.id);
       up.disabled = position === 0; down.disabled = position === list.length - 1;
+      item.draggable = true;
+      item.addEventListener('dragstart', () => { playlistDragTrackId = track.id; item.classList.add('dragging-track'); });
+      item.addEventListener('dragend', () => { playlistDragTrackId = null; item.classList.remove('dragging-track'); });
+      item.addEventListener('dragover', (event) => { if (playlistDragTrackId && playlistDragTrackId !== track.id) event.preventDefault(); });
+      item.addEventListener('drop', (event) => {
+        event.preventDefault();
+        const from = playlist.trackIds.indexOf(playlistDragTrackId), to = playlist.trackIds.indexOf(track.id);
+        if (from >= 0 && to >= 0 && from !== to) void reorderPlaylist(playlist.id, from, to);
+      });
     } else item.querySelector('.delete').onclick = () => deleteTrack(track.id);
     area.append(item); applyArtwork(item.querySelector('[data-art]'), track);
   });
@@ -862,12 +887,15 @@ function renderCollections(area, type) {
   });
 }
 function renderPlaylists(area) {
-  const search = $('#searchInput').value.trim().toLowerCase(); const shownPlaylists = search ? playlists.filter((playlist) => playlist.name.toLowerCase().includes(search)) : playlists;
+  const search = $('#searchInput').value.trim().toLowerCase(); const shownPlaylists = search ? playlists.filter((playlist) => `${playlist.name} ${playlist.note || ''}`.toLowerCase().includes(search)) : playlists;
   $('#librarySummary').textContent = `${shownPlaylists.length} ${shownPlaylists.length === 1 ? 'playlist' : 'playlists'}`;
   if (shownPlaylists.length) hideEmptyState();
   else showEmptyState({ icon: '☷', title: 'Create your first playlist', message: 'Build a local queue you can keep listening to offline.' });
-  const create = document.createElement('button'); create.className = 'create-playlist'; create.textContent = '+ Create playlist'; create.onclick = createPlaylist; area.append(create);
-  shownPlaylists.forEach((playlist) => {
+  const actions = document.createElement('div'); actions.className = 'playlist-library-actions';
+  const create = document.createElement('button'); create.className = 'create-playlist'; create.textContent = '+ Create playlist'; create.onclick = createPlaylist;
+  const folder = document.createElement('button'); folder.className = 'secondary-button'; folder.textContent = '▣ New folder'; folder.onclick = createPlaylistFolder;
+  actions.append(create, folder); area.append(actions);
+  const appendPlaylistCard = (playlist) => {
     const card = document.createElement('article'); card.className = 'playlist-card';
     const playlistTracks = playlist.trackIds.map((id) => tracks.find((track) => track.id === id)).filter(Boolean);
     const cover = playlist.artworkId
@@ -876,10 +904,22 @@ function renderPlaylists(area) {
     card.innerHTML = `<button class="playlist-open">${cover}<span><strong>${escapeHTML(playlist.name)}</strong><small>${playlistTracks.length} ${playlistTracks.length === 1 ? 'song' : 'songs'} · ${formatTotalDuration(playlistTracks.reduce((sum, track) => sum + (track.duration || 0), 0))}</small></span></button><button class="playlist-menu" aria-label="Playlist options">⋯</button>`;
     card.querySelector('.playlist-open').onclick = () => { activePlaylistId = playlist.id; render(); };
     card.querySelector('.playlist-menu').onclick = () => openPlaylistOptions(playlist.id);
-    area.append(card);
+    const host = area._playlistHost || area; host.append(card);
     if (playlist.artworkId) applyArtwork(card.querySelector('[data-playlist-art]'), { ...playlist, title: playlist.name });
     else playlistTracks.slice(0, 4).forEach((track) => applyArtwork(card.querySelector(`[data-art="${track.id}"]`), track));
-  });
+  };
+  const appendGroup = (label, group, folderId = '') => {
+    if (!group.length) return;
+    const section = document.createElement('section'); section.className = 'playlist-folder';
+    section.innerHTML = `<header><span><strong>${escapeHTML(label)}</strong><small>${group.length} ${group.length === 1 ? 'playlist' : 'playlists'}</small></span>${folderId ? '<button class="playlist-folder-menu" aria-label="Folder options">⋯</button>' : ''}</header>`;
+    if (folderId) section.querySelector('.playlist-folder-menu').onclick = () => openPlaylistFolderOptions(folderId);
+    area.append(section); area._playlistHost = section;
+    group.forEach(appendPlaylistCard);
+    delete area._playlistHost;
+  };
+  playlistFolders.forEach((entry) => appendGroup(entry.name, shownPlaylists.filter((playlist) => playlist.folderId === entry.id), entry.id));
+  const loose = shownPlaylists.filter((playlist) => !playlist.folderId || !playlistFolders.some((folder) => folder.id === playlist.folderId));
+  appendGroup(playlistFolders.length ? 'Other playlists' : 'Your playlists', loose);
 }
 function renderPlaylistDetail(area) {
   const playlist = playlists.find((entry) => entry.id === activePlaylistId);
@@ -889,13 +929,17 @@ function renderPlaylistDetail(area) {
   $('#librarySummary').textContent = `${list.length} ${list.length === 1 ? 'song' : 'songs'}`;
   $('#emptyState').style.display = 'none';
   const hero = document.createElement('article'); hero.className = 'collection-context';
-  hero.innerHTML = `<strong>${escapeHTML(playlist.name)}</strong><p>${list.length} ${list.length === 1 ? 'song' : 'songs'} · ${formatTotalDuration(list.reduce((total, track) => total + (track.duration || 0), 0))}</p><span class="collection-pill">LOCAL PLAYLIST</span>`;
+  const folder = playlistFolders.find((entry) => entry.id === playlist.folderId);
+  hero.innerHTML = `<strong>${escapeHTML(playlist.name)}</strong><p>${list.length} ${list.length === 1 ? 'song' : 'songs'} · ${formatTotalDuration(list.reduce((total, track) => total + (track.duration || 0), 0))}</p><span class="collection-pill">${folder ? escapeHTML(folder.name) : 'LOCAL PLAYLIST'}</span><div class="playlist-note-slot">${playlist.note ? `<p>${escapeHTML(playlist.note)}</p><button data-playlist-note>✎ Edit note</button>` : '<button data-playlist-note>＋ Add a note</button>'}</div>`;
+  hero.querySelector('[data-playlist-note]').onclick = () => openPlaylistNoteEditor(playlist.id);
   area.append(hero);
   const controls = document.createElement('div'); controls.className = 'playlist-controls';
-  controls.innerHTML = '<button class="back-link">‹ Playlists</button><button class="primary-button">Play</button><button class="secondary-button">Shuffle</button>';
+  controls.innerHTML = '<button class="back-link">‹ Playlists</button><button class="primary-button">Play</button><button class="secondary-button">Shuffle</button><button class="secondary-button" data-playlist-sort>Sort</button><button class="secondary-button" data-smart-order>Smart order</button>';
   controls.querySelector('.back-link').onclick = () => { activePlaylistId = null; currentView = 'playlists'; render(); };
   controls.querySelector('.primary-button').onclick = () => { if (list.length) { shuffleOn = false; updatePlayerMode(); playTrack(list[0].id, ids); } else toast('This playlist is empty'); };
-  controls.querySelector('.secondary-button').onclick = () => { if (list.length) { shuffleOn = true; updatePlayerMode(); playTrack(list[Math.floor(Math.random() * list.length)].id, ids); } else toast('This playlist is empty'); };
+  controls.querySelector('.secondary-button').onclick = () => { if (list.length) { const first = list[Math.floor(Math.random() * list.length)]; shuffleOn = true; playTrack(first.id, ids, { reason: 'playlist-shuffle' }); updatePlayerMode(); } else toast('This playlist is empty'); };
+  controls.querySelector('[data-playlist-sort]').onclick = () => openPlaylistSort(playlist.id);
+  controls.querySelector('[data-smart-order]').onclick = () => { void smartOrderPlaylist(playlist.id); };
   area.append(controls); renderTrackList(area, list, playlist);
 }
 
@@ -907,10 +951,10 @@ async function playTrack(id, sourceIds = null, options = {}) {
   const oldUrl = pendingAudio?.url || currentUrl;
   if (pendingAudio) { playbackDebug('pending-transition-superseded', { previous: pendingAudio.previous, next: trackDebug(track) }); pendingAudio = null; }
   if (sourceIds?.length) {
-    queue = [...new Set(sourceIds)]; queueIndex = queue.indexOf(id);
+    queue = uniquePlayableIds(sourceIds); queueIndex = queue.indexOf(id);
     if (shuffleOn) { shuffleBag = randomize(queue.filter((entry) => entry !== id)); shuffleHistory = []; }
   } else if (!queue.includes(id)) {
-    queue = visibleTracks().map((entry) => entry.id); queueIndex = queue.indexOf(id);
+    queue = uniquePlayableIds(visibleTracks().map((entry) => entry.id)); queueIndex = queue.indexOf(id);
     if (shuffleOn) refillShuffleBag(id);
   } else queueIndex = queue.indexOf(id);
   if (currentId === id && audio.src) {
@@ -980,7 +1024,7 @@ function syncNowPlaying(track = tracks.find((entry) => entry.id === currentId)) 
   const changed = Boolean(lastVisualTrackId && lastVisualTrackId !== track.id); lastVisualTrackId = track.id;
   const token = ++visualTransitionToken;
   if (changed) {
-    $('#npSeek').value = 0; $('#npSeek').style.setProperty('--seek-progress', '0%'); $('#miniPlayer').style.setProperty('--mini-progress', '0%');
+    $('#npSeek').value = 0; $('#npSeek').style.setProperty('--seek-progress', '0%'); $('#miniPlayer').style.setProperty('--mini-progress', '0%'); setWaveformProgress(0);
     ['#miniPlayer', '#nowPlayingScreen'].forEach((selector) => { const panel = $(selector); panel.classList.remove('song-changing', 'artwork-changing'); panel.classList.add('track-leaving'); });
     window.setTimeout(() => { if (token === visualTransitionToken) paintNowPlayingTrack(track, true); }, 92);
   } else paintNowPlayingTrack(track);
@@ -989,9 +1033,53 @@ function togglePlayback() {
   if (!audio.src && currentId) { playTrack(currentId); return; }
   if (audio.paused) void resumeCurrentAudio('toggle-playback'); else audio.pause();
 }
+function openSleepTimer() {
+  $('#sheetTitle').textContent = 'Sleep timer';
+  const remaining = sleepTimerEndsAt ? Math.max(0, Math.ceil((sleepTimerEndsAt - Date.now()) / 60000)) : 0;
+  $('#sheetContent').innerHTML = `<p class="sheet-note">Zombie will pause the current player when the timer finishes. Keep in mind iPhone may delay browser timers while an app is suspended.</p>${remaining ? `<p class="sheet-section">ACTIVE · ${remaining} MIN LEFT</p>` : ''}<button class="sheet-option" data-sleep="0">Turn off timer</button>${[15, 30, 45, 60].map((minutes) => `<button class="sheet-option" data-sleep="${minutes}">${minutes} minutes</button>`).join('')}`;
+  $('#sheetContent').querySelectorAll('[data-sleep]').forEach((button) => { button.onclick = () => setSleepTimer(Number(button.dataset.sleep)); });
+  showSheet();
+}
+function setSleepTimer(minutes) {
+  clearTimeout(sleepTimerHandle); sleepTimerHandle = null; sleepTimerEndsAt = 0;
+  if (!minutes) { closeSheet(); toast('Sleep timer off'); return; }
+  sleepTimerEndsAt = Date.now() + (minutes * 60 * 1000);
+  sleepTimerHandle = window.setTimeout(() => { sleepTimerHandle = null; sleepTimerEndsAt = 0; audio.pause(); toast('Sleep timer paused Zombie'); }, minutes * 60 * 1000);
+  closeSheet(); toast(`Sleep timer: ${minutes} minutes`);
+}
+function uniquePlayableIds(ids) {
+  const seen = new Set();
+  return (Array.isArray(ids) ? ids : []).filter((id) => !seen.has(id) && tracks.some((track) => track.id === id) && (seen.add(id), true));
+}
+function reconcileShuffleState(reason = 'reconcile') {
+  queue = uniquePlayableIds(queue);
+  if (currentId && !queue.includes(currentId)) queue.unshift(currentId);
+  queueIndex = currentId ? queue.indexOf(currentId) : -1;
+  const history = uniquePlayableIds(shuffleHistory).filter((id) => id !== currentId);
+  const historySet = new Set(history);
+  const bag = uniquePlayableIds(shuffleBag).filter((id) => id !== currentId && !historySet.has(id));
+  const known = new Set([currentId, ...history, ...bag]);
+  // If an old session lost only part of its bag, restore just those missing upcoming songs.
+  // A completed cycle has every item in history, so it remains completed until Repeat All is used.
+  const missing = shuffleOn ? queue.filter((id) => !known.has(id)) : [];
+  shuffleHistory = history;
+  shuffleBag = [...bag, ...randomize(missing)];
+  playbackDebug('shuffle-state-reconciled', { reason, queueLength: queue.length, bagLength: shuffleBag.length, historyLength: shuffleHistory.length, currentId });
+}
 function refillShuffleBag(excludeId = currentId) {
-  const options = queue.filter((id) => id !== excludeId);
-  shuffleBag = randomize(options); shuffleHistory = [];
+  queue = uniquePlayableIds(queue);
+  shuffleHistory = [];
+  shuffleBag = randomize(queue.filter((id) => id !== excludeId));
+  playbackDebug('shuffle-cycle-created', { excludeId, queueLength: queue.length, bagLength: shuffleBag.length });
+}
+function setShuffleEnabled(enabled) {
+  const next = Boolean(enabled);
+  if (next === shuffleOn) return;
+  shuffleOn = next;
+  if (shuffleOn) refillShuffleBag(currentId);
+  else { shuffleBag = []; shuffleHistory = []; queueIndex = currentId ? queue.indexOf(currentId) : queueIndex; }
+  discardPreparedNext('shuffle-mode-changed'); saveQueueSession(); updatePlayerMode();
+  toast(shuffleOn ? 'Shuffle on' : 'Shuffle off');
 }
 function nextQueueIdForPreload() {
   if (!queue.length) return null;
@@ -1320,10 +1408,80 @@ async function deleteTrack(id) {
 
 async function createPlaylist() {
   const name = prompt('Name your playlist'); if (!name?.trim()) return;
-  const playlist = { id: crypto.randomUUID(), name: name.trim(), trackIds: [], createdAt: Date.now() };
+  const playlist = { id: crypto.randomUUID(), name: name.trim(), trackIds: [], createdAt: Date.now(), updatedAt: Date.now() };
   await saveRecord('playlists', playlist); playlists.push(playlist); render(); toast('Playlist created');
 }
-async function savePlaylist(playlist) { await saveRecord('playlists', playlist); playlists = playlists.map((entry) => entry.id === playlist.id ? playlist : entry); }
+async function savePlaylist(playlist) { playlist.updatedAt = Date.now(); await saveRecord('playlists', playlist); playlists = playlists.map((entry) => entry.id === playlist.id ? playlist : entry); }
+async function savePlaylistFolders() { await saveRecord('settings', { key: 'playlistFolders', folders: playlistFolders }); }
+async function createPlaylistFolder() {
+  const name = prompt('Name your playlist folder'); if (!name?.trim()) return;
+  playlistFolders.push({ id: `folder:${crypto.randomUUID()}`, name: name.trim().slice(0, 80), createdAt: Date.now() });
+  await savePlaylistFolders(); render(); toast('Playlist folder created');
+}
+function openPlaylistFolderPicker(id) {
+  const playlist = playlists.find((entry) => entry.id === id); if (!playlist) return;
+  $('#sheetTitle').textContent = 'Move playlist';
+  $('#sheetContent').innerHTML = `<p class="sheet-note">Choose where “${escapeHTML(playlist.name)}” belongs.</p><button class="sheet-option" data-folder="">${playlist.folderId ? 'No folder' : '✓ No folder'}</button>${playlistFolders.map((folder) => `<button class="sheet-option" data-folder="${escapeHTML(folder.id)}">${playlist.folderId === folder.id ? '✓ ' : ''}${escapeHTML(folder.name)}</button>`).join('')}`;
+  $('#sheetContent').querySelectorAll('[data-folder]').forEach((button) => {
+    button.onclick = async () => { playlist.folderId = button.dataset.folder || ''; await savePlaylist(playlist); closeSheet(); render(); toast(playlist.folderId ? 'Playlist moved to folder' : 'Playlist removed from folder'); };
+  });
+  showSheet();
+}
+function openPlaylistFolderOptions(id) {
+  const folder = playlistFolders.find((entry) => entry.id === id); if (!folder) return;
+  $('#sheetTitle').textContent = folder.name;
+  $('#sheetContent').innerHTML = '<button class="sheet-option" data-folder-option="rename">Rename folder</button><button class="sheet-option danger-text" data-folder-option="delete">Delete folder</button>';
+  $('#sheetContent').querySelector('[data-folder-option="rename"]').onclick = async () => {
+    const name = prompt('New folder name', folder.name); if (name?.trim()) { folder.name = name.trim().slice(0, 80); await savePlaylistFolders(); render(); } closeSheet();
+  };
+  $('#sheetContent').querySelector('[data-folder-option="delete"]').onclick = async () => {
+    if (confirm(`Delete folder “${folder.name}”? Its playlists will stay in Zombie.`)) {
+      for (const playlist of playlists.filter((entry) => entry.folderId === id)) { playlist.folderId = ''; await savePlaylist(playlist); }
+      playlistFolders = playlistFolders.filter((entry) => entry.id !== id); await savePlaylistFolders(); render(); toast('Folder deleted; playlists were kept');
+    }
+    closeSheet();
+  };
+  showSheet();
+}
+function openPlaylistNoteEditor(id) {
+  const playlist = playlists.find((entry) => entry.id === id); if (!playlist) return;
+  $('#sheetTitle').textContent = 'Playlist note';
+  $('#sheetContent').innerHTML = `<label class="edit-field">A private note for this playlist<textarea id="playlistNote" maxlength="1200" placeholder="Mood, memory, reminder…">${escapeHTML(playlist.note || '')}</textarea></label><button class="sheet-option" id="savePlaylistNote">Save note</button>${playlist.note ? '<button class="sheet-option danger-text" id="deletePlaylistNote">Delete note</button>' : ''}`;
+  $('#savePlaylistNote').onclick = async () => { playlist.note = $('#playlistNote').value.trim(); await savePlaylist(playlist); closeSheet(); render(); toast(playlist.note ? 'Playlist note saved' : 'Playlist note cleared'); };
+  $('#deletePlaylistNote')?.addEventListener('click', async () => { delete playlist.note; await savePlaylist(playlist); closeSheet(); render(); toast('Playlist note deleted'); });
+  showSheet();
+}
+function openPlaylistSort(id) {
+  const playlist = playlists.find((entry) => entry.id === id); if (!playlist) return;
+  $('#sheetTitle').textContent = 'Sort playlist';
+  $('#sheetContent').innerHTML = '<p class="sheet-note">This changes the playlist’s saved order. It does not change your music library.</p><button class="sheet-option" data-playlist-sort="title">Title A–Z</button><button class="sheet-option" data-playlist-sort="artist">Artist A–Z</button><button class="sheet-option" data-playlist-sort="album">Album A–Z</button><button class="sheet-option" data-playlist-sort="recent">Recently added</button><button class="sheet-option" data-playlist-sort="oldest">Oldest added</button><button class="sheet-option" data-playlist-sort="duration">Duration</button>';
+  $('#sheetContent').querySelectorAll('[data-playlist-sort]').forEach((button) => { button.onclick = () => { void sortPlaylistTracks(id, button.dataset.playlistSort); }; });
+  showSheet();
+}
+async function sortPlaylistTracks(id, mode) {
+  const playlist = playlists.find((entry) => entry.id === id); if (!playlist) return;
+  const compare = (a, b) => {
+    if (mode === 'recent') return (b.addedAt || 0) - (a.addedAt || 0);
+    if (mode === 'oldest') return (a.addedAt || 0) - (b.addedAt || 0);
+    if (mode === 'duration') return (b.duration || 0) - (a.duration || 0);
+    return String(a[mode] || '').localeCompare(String(b[mode] || ''), undefined, { sensitivity: 'base', numeric: true });
+  };
+  playlist.trackIds = playlist.trackIds.map((trackId) => tracks.find((track) => track.id === trackId)).filter(Boolean).sort(compare).map((track) => track.id);
+  await savePlaylist(playlist); closeSheet(); render(); toast('Playlist sorted');
+}
+async function smartOrderPlaylist(id) {
+  const playlist = playlists.find((entry) => entry.id === id); if (!playlist) return;
+  const remaining = playlist.trackIds.map((trackId) => tracks.find((track) => track.id === trackId)).filter(Boolean);
+  const ordered = []; let last = null;
+  while (remaining.length) {
+    const preferred = remaining.filter((track) => !last || (track.artist !== last.artist && track.album !== last.album));
+    const relaxed = preferred.length ? preferred : remaining.filter((track) => !last || track.artist !== last.artist);
+    const choices = relaxed.length ? relaxed : remaining;
+    const next = choices[Math.floor(Math.random() * choices.length)];
+    ordered.push(next.id); remaining.splice(remaining.indexOf(next), 1); last = next;
+  }
+  playlist.trackIds = ordered; await savePlaylist(playlist); render(); toast('Smart order saved');
+}
 function openPlaylistSheet(trackId) {
   const track = tracks.find((entry) => entry.id === trackId); if (!track) return;
   $('#sheetTitle').textContent = `Add “${track.title}” to playlist`;
@@ -1340,14 +1498,17 @@ async function addToPlaylist(playlistId, trackId) {
 }
 function openPlaylistOptions(id) {
   const playlist = playlists.find((entry) => entry.id === id); if (!playlist) return;
-  $('#sheetTitle').textContent = playlist.name; $('#sheetContent').innerHTML = '<button class="sheet-option" data-option="cover">Choose playlist cover</button><button class="sheet-option" data-option="rename">Rename playlist</button><button class="sheet-option danger-text" data-option="delete">Delete playlist</button>';
+  $('#sheetTitle').textContent = playlist.name; $('#sheetContent').innerHTML = `<button class="sheet-option" data-option="cover">Choose playlist cover</button><button class="sheet-option" data-option="rename">Rename playlist</button><button class="sheet-option" data-option="note">${playlist.note ? 'Edit playlist note' : 'Add playlist note'}</button><button class="sheet-option" data-option="folder">${playlist.folderId ? 'Move to another folder' : 'Add to folder'}</button><button class="sheet-option" data-option="exclude">${playlist.excludeFromRecommendations ? '✓ Include in future recommendations' : '⊘ Exclude from future recommendations'}</button><button class="sheet-option danger-text" data-option="delete">Delete playlist</button>`;
   $('#sheetContent').querySelector('[data-option="cover"]').onclick = () => { artTarget = { type: 'playlist', id }; $('#artInput').click(); };
   $('#sheetContent').querySelector('[data-option="rename"]').onclick = async () => { const name = prompt('New playlist name', playlist.name); if (name?.trim()) { playlist.name = name.trim(); await savePlaylist(playlist); render(); } closeSheet(); };
+  $('#sheetContent').querySelector('[data-option="note"]').onclick = () => openPlaylistNoteEditor(id);
+  $('#sheetContent').querySelector('[data-option="folder"]').onclick = () => openPlaylistFolderPicker(id);
+  $('#sheetContent').querySelector('[data-option="exclude"]').onclick = async () => { playlist.excludeFromRecommendations = !playlist.excludeFromRecommendations; await savePlaylist(playlist); closeSheet(); toast(playlist.excludeFromRecommendations ? 'Excluded from future recommendations' : 'Included in future recommendations'); };
   $('#sheetContent').querySelector('[data-option="delete"]').onclick = async () => { if (confirm(`Delete playlist “${playlist.name}”? Songs will stay on your iPhone.`)) { await deleteRecord('playlists', id); playlists = playlists.filter((entry) => entry.id !== id); if (activePlaylistId === id) activePlaylistId = null; render(); } closeSheet(); };
   showSheet();
 }
 async function removeFromPlaylist(playlistId, trackId) { const playlist = playlists.find((entry) => entry.id === playlistId); if (!playlist) return; playlist.trackIds = playlist.trackIds.filter((entry) => entry !== trackId); await savePlaylist(playlist); render(); }
-async function reorderPlaylist(playlistId, from, to) { const playlist = playlists.find((entry) => entry.id === playlistId); if (!playlist || to < 0 || to >= playlist.trackIds.length) return; [playlist.trackIds[from], playlist.trackIds[to]] = [playlist.trackIds[to], playlist.trackIds[from]]; await savePlaylist(playlist); render(); }
+async function reorderPlaylist(playlistId, from, to) { const playlist = playlists.find((entry) => entry.id === playlistId); if (!playlist || from < 0 || to < 0 || to >= playlist.trackIds.length || from === to) return; const [moved] = playlist.trackIds.splice(from, 1); playlist.trackIds.splice(to, 0, moved); await savePlaylist(playlist); render(); }
 function closeSheet() {
   const sheet = $('#sheet'); if (sheet.classList.contains('hidden')) return;
   sheet.classList.remove('shown'); sheet.classList.add('closing'); $('.player-tools .queue-button.active:not(#visualButton)')?.classList.remove('active'); clearTimeout(window.zombieSheetTimer);
@@ -1357,13 +1518,14 @@ function closeSheet() {
 function openSongOptions(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = track.title;
-  $('#sheetContent').innerHTML = `<div class="sheet-song-header"><span class="sheet-song-art art-${artVariant(track)}" data-sheet-art="${track.id}"></span><span><strong>${track.emoji} ${escapeHTML(track.title)}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album || 'Single')}</small></span></div><p class="sheet-section">SONG</p><button class="sheet-option" data-action="favorite">${track.isFavorite ? '♥ Remove from favorites' : '♡ Add to favorites'}</button><button class="sheet-option" data-action="play-next">Play next</button><button class="sheet-option" data-action="queue">Add to queue</button><button class="sheet-option" data-action="playlist">Add or remove from playlist</button><button class="sheet-option" data-action="lyrics">≡ Lyrics</button><p class="sheet-section">EDIT</p><button class="sheet-option" data-action="edit">Edit song information</button><button class="sheet-option" data-action="artwork">Change artwork</button><button class="sheet-option" data-action="visual">${track.visualId ? '◇ Replace animated visual' : '◇ Add animated visual'}</button>${track.visualId ? '<button class="sheet-option" data-action="remove-visual">Remove animated visual</button>' : ''}<button class="sheet-option" data-action="details">Song details</button><p class="sheet-section">BROWSE</p><button class="sheet-option" data-action="album">Go to album</button><button class="sheet-option" data-action="artist">Go to artist</button><button class="sheet-option" data-action="share">Share local file</button><p class="sheet-section">DEVICE</p><button class="sheet-option danger-text" data-action="delete">Delete song from this iPhone</button>`;
+  $('#sheetContent').innerHTML = `<div class="sheet-song-header"><span class="sheet-song-art art-${artVariant(track)}" data-sheet-art="${track.id}"></span><span><strong>${track.emoji} ${escapeHTML(track.title)}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album || 'Single')}</small></span></div><p class="sheet-section">SONG</p><button class="sheet-option" data-action="favorite">${track.isFavorite ? '♥ Remove from favorites' : '♡ Add to favorites'}</button><button class="sheet-option" data-action="play-next">Play next</button><button class="sheet-option" data-action="queue">Add to queue</button><button class="sheet-option" data-action="playlist">Add or remove from playlist</button><button class="sheet-option" data-action="lyrics">≡ Lyrics</button><button class="sheet-option" data-action="exclude">${track.excludeFromRecommendations ? '✓ Include in future recommendations' : '⊘ Exclude from future recommendations'}</button><p class="sheet-section">EDIT</p><button class="sheet-option" data-action="edit">Edit song information</button><button class="sheet-option" data-action="artwork">Change artwork</button><button class="sheet-option" data-action="visual">${track.visualId ? '◇ Replace animated visual' : '◇ Add animated visual'}</button>${track.visualId ? '<button class="sheet-option" data-action="remove-visual">Remove animated visual</button>' : ''}<button class="sheet-option" data-action="details">Song details</button><p class="sheet-section">BROWSE</p><button class="sheet-option" data-action="album">Go to album</button><button class="sheet-option" data-action="artist">Go to artist</button><button class="sheet-option" data-action="share">Share local file</button><p class="sheet-section">DEVICE</p><button class="sheet-option danger-text" data-action="delete">Delete song from this iPhone</button>`;
   applyArtwork($('#sheetContent [data-sheet-art]'), track);
   $('#sheetContent').querySelector('[data-action="favorite"]').onclick = async () => { await toggleFavorite(id); closeSheet(); };
   $('#sheetContent').querySelector('[data-action="play-next"]').onclick = () => { addToQueue(id, true); closeSheet(); };
   $('#sheetContent').querySelector('[data-action="queue"]').onclick = () => { addToQueue(id); closeSheet(); };
   $('#sheetContent').querySelector('[data-action="playlist"]').onclick = () => openPlaylistSheet(id);
   $('#sheetContent').querySelector('[data-action="lyrics"]').onclick = () => { closeSheet(); openLyrics(id); };
+  $('#sheetContent').querySelector('[data-action="exclude"]').onclick = async () => { track.excludeFromRecommendations = !track.excludeFromRecommendations; await saveRecord('tracks', track); closeSheet(); render(); toast(track.excludeFromRecommendations ? 'Excluded from future recommendations' : 'Included in future recommendations'); };
   $('#sheetContent').querySelector('[data-action="edit"]').onclick = () => openSongEditor(id);
   $('#sheetContent').querySelector('[data-action="artwork"]').onclick = () => { artTarget = { type: 'track', id }; closeSheet(); $('#artInput').click(); };
   $('#sheetContent').querySelector('[data-action="visual"]').onclick = () => { visualTarget = id; closeSheet(); $('#visualInput').click(); };
@@ -1392,16 +1554,17 @@ async function shareTrack(track) {
 function openSongDetails(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = 'Song information';
-  $('#sheetContent').innerHTML = `<dl class="song-details"><dt>Title</dt><dd>${escapeHTML(track.title)}</dd><dt>Artist</dt><dd>${escapeHTML(track.artist)}</dd><dt>Album</dt><dd>${escapeHTML(track.album)}</dd><dt>Genre</dt><dd>${escapeHTML(track.genre || 'Not set')}</dd><dt>Duration</dt><dd>${formatTime(track.duration)}</dd><dt>Added</dt><dd>${new Date(track.addedAt).toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'})}</dd><dt>Last played</dt><dd>${track.lastPlayed ? new Date(track.lastPlayed).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'}) : 'Not played yet'}</dd><dt>Plays</dt><dd>${track.playCount || 0}</dd><dt>File</dt><dd>${escapeHTML(track.fileName || track.title)}</dd></dl><button class="sheet-option" id="editFromDetails">Edit song</button>`;
+  const fileType = (track.type || track.fileName?.split('.').pop() || 'Audio').replace(/^audio\//i, '').toUpperCase();
+  $('#sheetContent').innerHTML = `<dl class="song-details"><dt>Title</dt><dd>${escapeHTML(track.title)}</dd><dt>Artist</dt><dd>${escapeHTML(track.artist)}</dd><dt>Album</dt><dd>${escapeHTML(track.album)}</dd><dt>Genre</dt><dd>${escapeHTML(track.genre || 'Not set')}</dd><dt>Duration</dt><dd>${formatTime(track.duration)}</dd><dt>Added</dt><dd>${new Date(track.addedAt).toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'})}</dd><dt>Last played</dt><dd>${track.lastPlayed ? new Date(track.lastPlayed).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'}) : 'Not played yet'}</dd><dt>Plays</dt><dd>${track.playCount || 0}</dd><dt>File</dt><dd>${escapeHTML(track.fileName || track.title)}</dd><dt>Type</dt><dd>${escapeHTML(fileType)}</dd><dt>Size</dt><dd>${formatBytes(track.size || 0)}</dd>${track.note ? `<dt>Note</dt><dd>${escapeHTML(track.note)}</dd>` : ''}</dl><button class="sheet-option" id="editFromDetails">Edit song</button>`;
   $('#editFromDetails').onclick = () => openSongEditor(id); showSheet();
 }
 function openSongEditor(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = 'Edit song';
-  $('#sheetContent').innerHTML = `<label class="edit-field">Title<input id="editTitle" value="${escapeHTML(track.title)}"></label><label class="edit-field">Artist<input id="editArtist" value="${escapeHTML(track.artist)}"></label><label class="edit-field">Album<input id="editAlbum" value="${escapeHTML(track.album)}"></label><label class="edit-field">Emoji<input id="editEmoji" value="${escapeHTML(track.emoji)}" maxlength="8"></label><label class="edit-field">Genre<input id="editGenre" list="genreChoices" value="${escapeHTML(track.genre || '')}" placeholder="Optional genre"></label><datalist id="genreChoices"><option>Hip-Hop</option><option>R&B</option><option>Pop</option><option>Rock</option><option>Rap</option><option>Indie</option><option>Electronic</option><option>Reggae</option><option>Soul</option><option>Other</option></datalist><button class="sheet-option" id="chooseTrackArt">Choose artwork from Photos</button>${track.artworkId ? '<button class="sheet-option" id="removeTrackArt">Remove artwork</button>' : ''}<button class="sheet-option" id="saveSongEdit">Save changes</button>`;
+  $('#sheetContent').innerHTML = `<label class="edit-field">Title<input id="editTitle" value="${escapeHTML(track.title)}"></label><label class="edit-field">Artist<input id="editArtist" value="${escapeHTML(track.artist)}"></label><label class="edit-field">Album<input id="editAlbum" value="${escapeHTML(track.album)}"></label><label class="edit-field">Emoji<input id="editEmoji" value="${escapeHTML(track.emoji)}" maxlength="8"></label><label class="edit-field">Genre<input id="editGenre" list="genreChoices" value="${escapeHTML(track.genre || '')}" placeholder="Optional genre"></label><label class="edit-field">Personal note<textarea id="editNote" maxlength="1200" placeholder="Optional private note about this song">${escapeHTML(track.note || '')}</textarea></label><datalist id="genreChoices"><option>Hip-Hop</option><option>R&B</option><option>Pop</option><option>Rock</option><option>Rap</option><option>Indie</option><option>Electronic</option><option>Reggae</option><option>Soul</option><option>Other</option></datalist><button class="sheet-option" id="chooseTrackArt">Choose artwork from Photos</button>${track.artworkId ? '<button class="sheet-option" id="removeTrackArt">Remove artwork</button>' : ''}<button class="sheet-option" id="saveSongEdit">Save changes</button>`;
   $('#chooseTrackArt').onclick = () => { artTarget = { type: 'track', id }; $('#artInput').click(); };
   if ($('#removeTrackArt')) $('#removeTrackArt').onclick = async () => { await removeTrackArtwork(track); render(); syncNowPlaying(); closeSheet(); toast('Artwork removed'); };
-  $('#saveSongEdit').onclick = async () => { track.title = $('#editTitle').value.trim() || 'Untitled song'; track.artist = neutralArtist($('#editArtist').value); track.album = $('#editAlbum').value.trim() || 'Single'; track.emoji = $('#editEmoji').value.trim() || randomEmoji(); track.genre = $('#editGenre').value.trim(); await saveRecord('tracks', track); render(); syncNowPlaying(); updateMediaSession(track); closeSheet(); toast('Song details saved'); };
+  $('#saveSongEdit').onclick = async () => { track.title = $('#editTitle').value.trim() || 'Untitled song'; track.artist = neutralArtist($('#editArtist').value); track.album = $('#editAlbum').value.trim() || 'Single'; track.emoji = $('#editEmoji').value.trim() || randomEmoji(); track.genre = $('#editGenre').value.trim(); track.note = $('#editNote').value.trim(); await saveRecord('tracks', track); render(); syncNowPlaying(); updateMediaSession(track); closeSheet(); toast('Song details saved'); };
   showSheet();
 }
 async function removeTrackArtwork(track) {
@@ -1440,14 +1603,16 @@ async function requestPersistentStorage() {
 }
 async function clearAllMusic() {
   if (!confirm('Clear every song, favorite, and playlist from this iPhone? This cannot be undone.')) return;
-  const transaction = db.transaction(['tracks', 'audioBlobs', 'playlists', 'artworkBlobs'], 'readwrite');
+  const transaction = db.transaction(['tracks', 'audioBlobs', 'playlists', 'artworkBlobs', 'settings'], 'readwrite');
   ['tracks', 'audioBlobs', 'playlists', 'artworkBlobs'].forEach((name) => transaction.objectStore(name).clear());
+  transaction.objectStore('settings').delete('playlistFolders');
   await new Promise((resolve, reject) => { transaction.oncomplete = resolve; transaction.onerror = () => reject(transaction.error); });
   audio.pause(); audio.removeAttribute('src'); audio.load(); if (currentUrl) URL.revokeObjectURL(currentUrl);
-  tracks = []; playlists = []; queue = []; currentId = null; currentUrl = null; activePlaylistId = null; $('#miniPlayer').classList.add('hidden'); render(); refreshStorageStatus(); toast('All music cleared from this device');
+  tracks = []; playlists = []; playlistFolders = []; queue = []; currentId = null; currentUrl = null; activePlaylistId = null; $('#miniPlayer').classList.add('hidden'); render(); refreshStorageStatus(); toast('All music cleared from this device');
 }
 
 function wireUI() {
+  buildDecorativeWaveform();
   $('#importButton').onclick = () => $('#fileInput').click(); $('#chooseFiles').onclick = () => $('#fileInput').click();
   $('#fileInput').onchange = (event) => { importFiles(event.target.files); event.target.value = ''; };
   $('#artInput').onchange = (event) => { saveSelectedArtwork(event.target.files?.[0]); event.target.value = ''; };
@@ -1466,18 +1631,19 @@ function wireUI() {
   $('#openNowPlaying').onclick = openNowPlaying; $('#closeNowPlaying').onclick = closeNowPlaying;
   $('#miniPlay').onclick = togglePlayback; $('#miniNext').onclick = () => nextTrack(); $('#miniPrevious').onclick = previousTrack;
   $('#playButton').onclick = togglePlayback; $('#nextButton').onclick = () => nextTrack(); $('#previousButton').onclick = previousTrack;
-  $('#shuffleButton').onclick = () => { shuffleOn = !shuffleOn; if (shuffleOn) refillShuffleBag(); updatePlayerMode(); toast(shuffleOn ? 'Shuffle on' : 'Shuffle off'); };
+  $('#shuffleButton').onclick = () => setShuffleEnabled(!shuffleOn);
   $('#repeatButton').onclick = () => { repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off'; updatePlayerMode(); toast(`Repeat ${repeatMode}`); };
-  $('#npSeek').oninput = (event) => { event.target.style.setProperty('--seek-progress', `${event.target.value}%`); if (audio.duration) { audio.currentTime = (event.target.value / 100) * audio.duration; savePlayerState(true); } };
+  $('#npSeek').oninput = (event) => { const percent = Number(event.target.value) || 0; event.target.style.setProperty('--seek-progress', `${percent}%`); setWaveformProgress(percent); if (audio.duration) { audio.currentTime = (percent / 100) * audio.duration; $('#currentTime').textContent = formatTime(audio.currentTime); $('#remainingTime').textContent = formatRemainingTime((audio.duration || 0) - audio.currentTime); savePlayerState(true); } };
   $('#volumeControl').oninput = (event) => { audio.volume = Number(event.target.value); savePlayerState(true); };
   $('#npFavorite').onclick = () => currentId && toggleFavorite(currentId); $('#npMore').onclick = () => currentId && openSongOptions(currentId); $('#queueButton').onclick = openQueue;
+  $('#sleepTimerButton').onclick = openSleepTimer; $('#addPlaylistButton').onclick = () => currentId && openPlaylistSheet(currentId); $('#songInfoButton').onclick = () => currentId && openSongDetails(currentId); $('#npUtilityMore').onclick = () => currentId && openSongOptions(currentId);
   $('#lyricsButton').onclick = () => openLyrics(); $('#audioModsButton').onclick = openAudioMods;
   $('#visualButton').onclick = () => { preferences.visualMode = preferences.visualMode === 'animation' ? 'artwork' : 'animation'; savePreferences(); void syncNowPlayingVisual(); const track = tracks.find((entry) => entry.id === currentId); if (preferences.visualMode === 'animation' && !track?.visualId) toast('Add a local animated visual from the song menu'); };
   $('#closeLyrics').onclick = closeLyrics; $('#lyricsMenuButton').onclick = openLyricsMenu;
   $('#syncPreviousButton').onclick = backLyricsSyncLine; $('#syncRedoButton').onclick = redoLyricsSyncLine; $('#syncSaveButton').onclick = () => { void saveLyricsSync(); }; $('#syncCancelButton').onclick = cancelLyricsSync;
   $('#sheetClose').onclick = closeSheet; $('#sheet').onclick = (event) => { if (event.target === $('#sheet')) closeSheet(); };
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
-  audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); $('#currentTime').textContent = formatTime(audio.currentTime); $('#remainingTime').textContent = formatRemainingTime((audio.duration || 0) - (audio.currentTime || 0)); updateMediaPosition(); updateSyncedLyrics(); savePlayerState(); };
+  audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); $('#remainingTime').textContent = formatRemainingTime((audio.duration || 0) - (audio.currentTime || 0)); updateMediaPosition(); updateSyncedLyrics(); savePlayerState(); };
   audio.onloadedmetadata = () => { $('#remainingTime').textContent = formatRemainingTime(audio.duration); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
   audio.onplay = () => { playbackEpoch += 1; syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
   audio.onpause = () => { syncAmbientMotionState(); capturePausedResumeSnapshot('audio-pause-event'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; animatePlaybackControls('paused'); setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
@@ -1522,8 +1688,8 @@ function wireUI() {
 }
 async function initialise() {
   try {
-    installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=32').catch(() => {});
+    installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=33').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
