@@ -100,6 +100,31 @@ function syncAmbientMotionState() {
   document.documentElement.dataset.zombiePlayback = playing ? 'playing' : 'paused'; document.documentElement.dataset.zombieVisibility = document.visibilityState || 'visible';
   ['#nowPlayingScreen', '#miniPlayer'].forEach((selector) => { const panel = $(selector); panel?.classList.toggle('is-playing', playing); panel?.classList.toggle('is-paused', !playing); });
 }
+function installMobileScaleGuard() {
+  const root = document.documentElement;
+  const updateViewportMetrics = () => {
+    const visual = window.visualViewport;
+    const height = Math.max(1, Number(visual?.height) || window.innerHeight || 1);
+    root.style.setProperty('--zombie-vh', `${height / 100}px`);
+    const scale = Number(visual?.scale);
+    root.dataset.zombieViewportScale = Number.isFinite(scale) && Math.abs(scale - 1) > .015 ? 'scaled' : 'normal';
+  };
+  const blockPinch = (event) => { if (event.touches?.length > 1) event.preventDefault(); };
+  updateViewportMetrics();
+  window.visualViewport?.addEventListener('resize', updateViewportMetrics, { passive: true });
+  window.visualViewport?.addEventListener('scroll', updateViewportMetrics, { passive: true });
+  window.addEventListener('orientationchange', updateViewportMetrics, { passive: true });
+  window.addEventListener('pageshow', updateViewportMetrics, { passive: true });
+  // Page-level pinch/double-tap zoom makes a Home Screen PWA look like a tiny desktop site.
+  // Single-finger scrolling, range inputs, queues, and lyric scrolling are deliberately left alone.
+  document.addEventListener('gesturestart', (event) => event.preventDefault(), { passive: false });
+  document.addEventListener('gesturechange', (event) => event.preventDefault(), { passive: false });
+  document.addEventListener('touchstart', blockPinch, { passive: false });
+  document.addEventListener('touchmove', blockPinch, { passive: false });
+  document.addEventListener('dblclick', (event) => {
+    if (!event.target.closest('input,textarea,select,[contenteditable="true"]')) event.preventDefault();
+  }, { capture: true, passive: false });
+}
 
 function toast(message) {
   const element = $('#toast');
@@ -1411,8 +1436,8 @@ function wireUI() {
 }
 async function initialise() {
   try {
-    await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=27').catch(() => {});
+    installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=28').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
