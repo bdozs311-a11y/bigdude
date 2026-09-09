@@ -275,23 +275,18 @@ function lyricOffsetFor(track) { const value = Number(track?.lyricOffset); retur
 function lyricPlaybackTime(track) { return Math.max(0, (audio.currentTime || 0) - lyricOffsetFor(track)); }
 function formatLyricOffset(offset) { const value = Math.round((Number(offset) || 0) * 10) / 10; return `${value > 0 ? '+' : ''}${value.toFixed(1)}s`; }
 function setLyricsScreenMode(syncing = false) {
-  $('#lyricsMode').textContent = syncing ? 'SYNC LYRICS' : 'LYRICS';
-  $('#editLyrics').classList.toggle('hidden', syncing);
-  $('#lyricsSyncToolbar').classList.toggle('hidden', syncing);
+  $('#lyricsMode').textContent = syncing ? 'FIX SYNC' : 'LYRICS';
+  $('#lyricsMenuButton').classList.toggle('hidden', syncing);
   $('#lyricsSyncActions').classList.toggle('hidden', !syncing);
-}
-function updateLyricsOffsetButton(track = tracks.find((entry) => entry.id === activeLyricsId)) {
-  const button = $('#lyricsOffsetButton'); if (button) button.textContent = `± ${formatLyricOffset(lyricOffsetFor(track))}`;
 }
 function renderLyrics(track = tracks.find((entry) => entry.id === activeLyricsId)) {
   const content = $('#lyricsContent'); if (!content) return;
   if (lyricsSyncDraft) { renderLyricsSync(); return; }
-  setLyricsScreenMode(false); updateLyricsOffsetButton(track);
+  setLyricsScreenMode(false);
   if (!track) { content.innerHTML = '<div class="lyrics-empty"><strong>No song selected</strong>Start a song, then open Lyrics.</div>'; return; }
   $('#lyricsTrackTitle').textContent = `${track.emoji} ${track.title}`; $('#lyricsTrackArtist').textContent = `${track.artist} · ${track.album || 'Single'}`;
   if (track.syncedLyrics?.length) {
     content.innerHTML = track.syncedLyrics.map((line, index) => `<button class="lyric-line lyric-future" data-lyric-index="${index}" data-lyric-time="${line.time}">${escapeHTML(line.text)}</button>`).join('');
-    content.querySelectorAll('[data-lyric-time]').forEach((button) => { button.onclick = () => { const time = Number(button.dataset.lyricTime); if (Number.isFinite(time) && audio.src) { audio.currentTime = Math.max(0, time + lyricOffsetFor(track)); updateSyncedLyrics(true); } }; });
     lastLyricsIndex = -1; updateSyncedLyrics(true);
   } else if (track.lyrics?.trim()) {
     content.innerHTML = `<p class="plain-lyrics">${escapeHTML(track.lyrics)}</p>`; lastLyricsIndex = -1;
@@ -313,7 +308,7 @@ function updateSyncedLyrics(force = false) {
   const activeLine = lines[activeIndex]; const content = $('#lyricsContent');
   if (activeLine && content) {
     const lineBox = activeLine.getBoundingClientRect(), contentBox = content.getBoundingClientRect();
-    const target = Math.max(0, content.scrollTop + lineBox.top - contentBox.top - (content.clientHeight * .42));
+    const target = Math.max(0, content.scrollTop + lineBox.top - contentBox.top - (content.clientHeight * .5));
     const needsScroll = force || Math.abs(content.scrollTop - target) > Math.max(42, content.clientHeight * .18);
     if (needsScroll && (force || Date.now() >= lyricsManualScrollUntil)) {
       lyricsAutoScrollUntil = Date.now() + 650;
@@ -326,11 +321,21 @@ function openLyrics(id = currentId) {
   lyricsSyncDraft = null; lyricsManualScrollUntil = 0; $('#lyricsContent').classList.remove('manual-scroll'); setLyricsScreenMode(false); activeLyricsId = id; lastLyricsIndex = -1; const screen = $('#lyricsScreen'); screen.classList.remove('hidden'); $('#lyricsButton').classList.add('active'); syncModalScrollLock(); requestAnimationFrame(() => screen.classList.add('presented')); renderLyrics(track);
 }
 function closeLyrics() { lyricsSyncDraft = null; setLyricsScreenMode(false); const screen = $('#lyricsScreen'); screen.classList.remove('presented'); $('#lyricsButton').classList.remove('active'); setTimeout(() => { screen.classList.add('hidden'); syncModalScrollLock(); }, 180); activeLyricsId = null; lastLyricsIndex = -1; }
+function openLyricsMenu() {
+  const track = tracks.find((entry) => entry.id === activeLyricsId); if (!track) return;
+  $('#sheetTitle').textContent = 'Lyrics';
+  $('#sheetContent').innerHTML = `<button id="fixLyricsSync" class="lyrics-main-action">Fix Sync</button><details class="lyrics-advanced"><summary>Advanced Sync Settings</summary><p>Fine-tune timing, edit individual lines, or import lyrics. These tools are hidden during normal playback.</p><button class="sheet-option" id="advancedLyricsOffset">Adjust all lyric timing</button>${track.syncedLyrics?.length ? '<button class="sheet-option" id="advancedLineEditor">Edit timestamps and lyric text</button>' : ''}<button class="sheet-option" id="advancedLyricsEditor">Import or edit lyrics</button></details>`;
+  $('#fixLyricsSync').onclick = () => { closeSheet(); startLyricsSync(); };
+  $('#advancedLyricsOffset').onclick = openLyricsOffset;
+  $('#advancedLineEditor')?.addEventListener('click', () => openSyncedLineEditor(track.id));
+  $('#advancedLyricsEditor').onclick = () => openLyricsEditor(track.id);
+  showSheet();
+}
 function openLyricsOffset() {
   const track = tracks.find((entry) => entry.id === activeLyricsId); if (!track) return;
   const offset = lyricOffsetFor(track); $('#sheetTitle').textContent = 'Lyrics sync';
   $('#sheetContent').innerHTML = `<p class="sheet-note">Shift every timestamp for this song. Positive makes lyrics appear later; negative makes them appear earlier. Saved offline for this song.</p><div class="lyrics-offset-readout" id="lyricsOffsetValue">${formatLyricOffset(offset)}</div><div class="lyrics-offset-buttons"><button class="sheet-option" data-lyrics-offset="-1">−1.0s</button><button class="sheet-option" data-lyrics-offset="-.5">−0.5s</button><button class="sheet-option" data-lyrics-offset=".5">+0.5s</button><button class="sheet-option" data-lyrics-offset="1">+1.0s</button></div><label class="edit-field">Manual offset (seconds)<input id="lyricsOffsetInput" type="number" inputmode="decimal" min="-60" max="60" step="0.1" value="${offset}"></label><button class="sheet-option" id="saveLyricsOffset">Set offset</button>`;
-  const applyOffset = async (value) => { if (!Number.isFinite(value)) return; track.lyricOffset = Math.max(-60, Math.min(60, Math.round(value * 100) / 100)); await saveRecord('tracks', track); updateLyricsOffsetButton(track); lastLyricsIndex = -1; updateSyncedLyrics(true); openLyricsOffset(); };
+  const applyOffset = async (value) => { if (!Number.isFinite(value)) return; track.lyricOffset = Math.max(-60, Math.min(60, Math.round(value * 100) / 100)); await saveRecord('tracks', track); lastLyricsIndex = -1; updateSyncedLyrics(true); openLyricsOffset(); };
   $('#sheetContent').querySelectorAll('[data-lyrics-offset]').forEach((button) => { button.onclick = () => { void applyOffset(offset + Number(button.dataset.lyricsOffset)); }; });
   $('#saveLyricsOffset').onclick = () => { void applyOffset(Number($('#lyricsOffsetInput').value)); };
   showSheet();
@@ -347,9 +352,9 @@ function startLyricsSync() {
 function renderLyricsSync() {
   const draft = lyricsSyncDraft; const content = $('#lyricsContent'); if (!draft || !content) return;
   const track = tracks.find((entry) => entry.id === draft.trackId); if (!track) return;
-  $('#lyricsTrackTitle').textContent = `${track.emoji} ${track.title}`; $('#lyricsTrackArtist').textContent = 'Tap Set Time while the song plays';
-  content.innerHTML = `<div class="lyrics-sync-note">Select a line, then tap <strong>Set time</strong> at the moment it should appear. The next line is selected automatically.</div><div class="lyrics-sync-list">${draft.lines.map((line, index) => `<button class="lyrics-sync-line ${index === draft.index ? 'selected' : ''}" data-sync-line="${index}"><span>${formatLrcTimestamp(line.time)}</span><strong>${escapeHTML(line.text)}</strong></button>`).join('')}</div>`;
-  content.querySelectorAll('[data-sync-line]').forEach((button) => { button.onclick = () => { draft.index = Number(button.dataset.syncLine); renderLyricsSync(); }; });
+  $('#lyricsTrackTitle').textContent = `${track.emoji} ${track.title}`; $('#lyricsTrackArtist').textContent = 'Tap each line as you hear it begin';
+  content.innerHTML = `<div class="lyrics-sync-note">Keep the song playing.<strong>Tap the bright line right when you hear it start.</strong>The next line is ready automatically.</div><div class="lyrics-sync-list">${draft.lines.map((line, index) => `<button class="lyrics-sync-line ${index === draft.index ? 'selected' : ''}" data-sync-line="${index}" aria-label="${index === draft.index ? 'Set time for: ' : 'Choose lyric line: '}${escapeHTML(line.text)}">${escapeHTML(line.text)}</button>`).join('')}</div>`;
+  content.querySelectorAll('[data-sync-line]').forEach((button) => { button.onclick = () => { const index = Number(button.dataset.syncLine); if (index === draft.index) setNextLyricTime(); else { draft.index = index; renderLyricsSync(); } }; });
   const selected = content.querySelector('.lyrics-sync-line.selected'); selected?.scrollIntoView({ block: 'center', behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
 }
 function setNextLyricTime() {
@@ -358,7 +363,11 @@ function setNextLyricTime() {
   if (draft.index < draft.lines.length - 1) draft.index += 1; else toast('Last lyric line timed');
   renderLyricsSync();
 }
-function redoPreviousLyricTime() { if (!lyricsSyncDraft) return; lyricsSyncDraft.index = Math.max(0, lyricsSyncDraft.index - 1); renderLyricsSync(); }
+function backLyricsSyncLine() { if (!lyricsSyncDraft) return; lyricsSyncDraft.index = Math.max(0, lyricsSyncDraft.index - 1); renderLyricsSync(); }
+function redoLyricsSyncLine() {
+  const draft = lyricsSyncDraft; if (!draft) return;
+  const previous = Math.max(0, draft.index - 1); draft.lines[previous].time = 0; draft.index = previous; renderLyricsSync();
+}
 async function saveLyricsSync() {
   const draft = lyricsSyncDraft; const track = tracks.find((entry) => entry.id === draft?.trackId); if (!draft || !track) return;
   const lines = draft.lines.map((line) => ({ time: Math.max(0, Number(line.time) || 0), text: String(line.text || '').trim() })).filter((line) => line.text).sort((a, b) => a.time - b.time);
@@ -1238,9 +1247,8 @@ function wireUI() {
   $('#npFavorite').onclick = () => currentId && toggleFavorite(currentId); $('#npMore').onclick = () => currentId && openSongOptions(currentId); $('#queueButton').onclick = openQueue;
   $('#lyricsButton').onclick = () => openLyrics(); $('#audioModsButton').onclick = openAudioMods;
   $('#visualButton').onclick = () => { preferences.visualMode = preferences.visualMode === 'animation' ? 'artwork' : 'animation'; savePreferences(); void syncNowPlayingVisual(); const track = tracks.find((entry) => entry.id === currentId); if (preferences.visualMode === 'animation' && !track?.visualId) toast('Add a local animated visual from the song menu'); };
-  $('#closeLyrics').onclick = closeLyrics; $('#editLyrics').onclick = () => activeLyricsId && openLyricsEditor(activeLyricsId);
-  $('#lyricsOffsetButton').onclick = openLyricsOffset; $('#syncLyricsButton').onclick = startLyricsSync;
-  $('#syncPreviousButton').onclick = redoPreviousLyricTime; $('#syncSetTimeButton').onclick = setNextLyricTime; $('#syncSaveButton').onclick = () => { void saveLyricsSync(); }; $('#syncCancelButton').onclick = cancelLyricsSync;
+  $('#closeLyrics').onclick = closeLyrics; $('#lyricsMenuButton').onclick = openLyricsMenu;
+  $('#syncPreviousButton').onclick = backLyricsSyncLine; $('#syncRedoButton').onclick = redoLyricsSyncLine; $('#syncSaveButton').onclick = () => { void saveLyricsSync(); }; $('#syncCancelButton').onclick = cancelLyricsSync;
   $('#sheetClose').onclick = closeSheet; $('#sheet').onclick = (event) => { if (event.target === $('#sheet')) closeSheet(); };
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
   audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); $('#currentTime').textContent = formatTime(audio.currentTime); $('#remainingTime').textContent = formatRemainingTime((audio.duration || 0) - (audio.currentTime || 0)); updateMediaPosition(); updateSyncedLyrics(); savePlayerState(); };
@@ -1289,7 +1297,7 @@ function wireUI() {
 async function initialise() {
   try {
     await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=24').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=25').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
