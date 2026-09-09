@@ -1,5 +1,5 @@
-const VERSION='zombie-shell-v23';
-const APP_SHELL=['./','./index.html','./style.css?v=23','./app.js?v=23','./manifest.webmanifest?v=23','./zombie-icon-180.png?v=15','./zombie-icon-192.png?v=15','./zombie-icon-512.png?v=15'];
+const VERSION='zombie-shell-v24';
+const APP_SHELL=['./','./index.html','./style.css?v=24','./app.js?v=24','./manifest.webmanifest?v=24','./zombie-icon-180.png?v=15','./zombie-icon-192.png?v=15','./zombie-icon-512.png?v=15'];
 self.addEventListener('install',(event)=>event.waitUntil(caches.open(VERSION).then((cache)=>cache.addAll(APP_SHELL)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',(event)=>event.waitUntil(caches.keys().then((keys)=>Promise.all(keys.filter((key)=>key!==VERSION).map((key)=>caches.delete(key)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',(event)=>{
