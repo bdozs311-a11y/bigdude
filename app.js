@@ -1422,18 +1422,15 @@ async function refreshStorageStatus() {
   try {
     const estimate = await navigator.storage?.estimate?.();
     const usage = estimate?.usage || tracks.reduce((sum, track) => sum + (track.size || 0), 0);
-    const quota = estimate?.quota;
-    $('#storageStatus').textContent = `${formatBytes(usage)} used${quota ? ` of ${formatBytes(quota)}` : ''} · ${libraryStats()}`;
+    $('#storageStatus').textContent = `${formatBytes(usage)} used`;
     const persisted = await navigator.storage?.persisted?.();
     $('#persistenceStatus').textContent = persisted ? 'Storage protection is enabled.' : 'Ask iPhone to protect this library from cleanup.';
-    refreshLibraryStats();
-  } catch { $('#storageStatus').textContent = `${tracks.length} songs stored on this device`; }
+  } catch { $('#storageStatus').textContent = `${formatBytes(tracks.reduce((sum, track) => sum + (track.size || 0), 0))} used`; }
+  refreshLibraryStats();
 }
 function refreshLibraryStats() {
   const favorites = tracks.filter((track) => track.isFavorite).length;
-  const mostPlayed = [...tracks].sort((a, b) => (b.playCount || 0) - (a.playCount || 0))[0];
-  const recent = [...tracks].sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 2).map((track) => track.title).join(', ');
-  $('#libraryStats').textContent = `${libraryStats()} · ${playlists.length} ${playlists.length === 1 ? 'playlist' : 'playlists'} · ${favorites} favorites${mostPlayed?.playCount ? ` · Most played: ${mostPlayed.title}` : ''}${recent ? ` · Recent: ${recent}` : ''}`;
+  $('#libraryStats').innerHTML = `<span class="library-stat"><strong>${tracks.length}</strong><small>${tracks.length === 1 ? 'Song' : 'Songs'}</small></span><span class="library-stat"><strong>${favorites}</strong><small>${favorites === 1 ? 'Favorite' : 'Favorites'}</small></span><span class="library-stat"><strong>${playlists.length}</strong><small>${playlists.length === 1 ? 'Playlist' : 'Playlists'}</small></span>`;
 }
 async function requestPersistentStorage() {
   try { const granted = await navigator.storage?.persist?.(); await refreshStorageStatus(); toast(granted ? 'Zombie storage is protected' : 'iPhone manages storage automatically'); } catch { toast('Storage protection is unavailable here'); }
@@ -1523,7 +1520,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=30').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=31').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
