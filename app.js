@@ -22,6 +22,7 @@ const FULL_BACKUP_LIMIT = 40 * 1024 * 1024;
 
 const randomEmoji = () => EMOJIS[Math.floor(Math.random() * EMOJIS.length)];
 const formatTime = (seconds) => !Number.isFinite(seconds) ? '0:00' : `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+const formatRemainingTime = (seconds) => `−${formatTime(Math.max(0, seconds || 0))}`;
 const formatBytes = (bytes = 0) => bytes < 1e6 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1e6).toFixed(1)} MB`;
 const formatTotalDuration = (seconds = 0) => { const minutes = Math.round(seconds / 60); const days = Math.floor(minutes / 1440); const hours = Math.floor((minutes % 1440) / 60); const mins = minutes % 60; return `${days ? `${days} day${days === 1 ? '' : 's'} ` : ''}${hours ? `${hours} hr ` : ''}${mins ? `${mins} min` : '0 min'}`.trim(); };
 const escapeHTML = (value = '') => { const element = document.createElement('span'); element.textContent = value; return element.innerHTML; };
@@ -175,12 +176,14 @@ function saveTrack(track, blob) {
 function getAudioBlob(id) { return getRecord('audioBlobs', id).then((record) => record?.blob); }
 async function saveArtwork(id, blob) { const oldUrl = artworkUrls.get(id); if (oldUrl) URL.revokeObjectURL(oldUrl); await saveRecord('artworkBlobs', { id, blob }); artworkUrls.delete(id); }
 async function applyArtwork(element, track) {
+  const artworkKey = track?.artworkId || '';
+  element.dataset.artworkKey = artworkKey;
   element.className = `${element.className.split(' ').filter((name) => !name.startsWith('art-')).join(' ')} art-${artVariant(track)}`;
   element.style.backgroundImage = '';
   element.classList.remove('has-art');
   element.textContent = '';
   if (!track?.artworkId) return;
-  try { const record = await getRecord('artworkBlobs', track.artworkId); if (!record?.blob) return; let url = artworkUrls.get(track.artworkId); if (!url) { url = URL.createObjectURL(record.blob); artworkUrls.set(track.artworkId, url); } element.style.backgroundImage = `url("${url}")`; element.classList.add('has-art'); element.textContent = ''; } catch { /* fall back to local Zombie art */ }
+  try { const record = await getRecord('artworkBlobs', track.artworkId); if (!record?.blob || element.dataset.artworkKey !== artworkKey) return; let url = artworkUrls.get(track.artworkId); if (!url) { url = URL.createObjectURL(record.blob); artworkUrls.set(track.artworkId, url); } if (element.dataset.artworkKey !== artworkKey) return; element.style.backgroundImage = `url("${url}")`; element.classList.add('has-art'); element.textContent = ''; } catch { /* fall back to local Zombie art */ }
 }
 async function mediaArtworkFor(track) {
   const fallback = new URL('zombie-icon-512.png?v=15', location.href).href;
@@ -268,6 +271,7 @@ function configureMediaSession() {
     nexttrack: () => { void nextTrack().catch((error) => playbackDebug('media-next-failed', { actionError: error?.message || String(error) })); },
   };
   Object.entries(actions).forEach(([action, handler]) => { try { navigator.mediaSession.setActionHandler(action, handler); } catch { /* action not exposed by this iOS version */ } });
+  playbackDebug('media-session-handlers-configured', { handlers: Object.keys(actions) });
 }
 function artVariant(track) { let hash = 0; for (const character of `${track?.title || ''}${track?.artist || ''}${track?.genre || ''}`) hash = ((hash << 5) - hash) + character.charCodeAt(0); return Math.abs(hash) % 6; }
 function randomize(values) {
@@ -460,8 +464,8 @@ function syncNowPlaying(track = tracks.find((entry) => entry.id === currentId)) 
   if (!track) return;
   ['#miniPlayer', '#nowPlayingScreen'].forEach((selector) => { const panel = $(selector); panel.classList.remove('song-changing'); requestAnimationFrame(() => panel.classList.add('song-changing')); });
   $('#nowTitle').textContent = track.title; $('#nowArtist').textContent = track.artist;
-  applyArtwork($('#miniArt'), track); applyArtwork($('#npArt'), track);
-  $('#npEmoji').textContent = track.emoji; $('#npTitle').textContent = track.title; $('#npArtist').textContent = `${track.artist} · ${track.album}`;
+  applyArtwork($('#miniArt'), track); applyArtwork($('#npArt'), track); applyArtwork($('#npBackdrop'), track);
+  $('#npEmoji').textContent = track.emoji; $('#npTitle').textContent = track.title; $('#npArtist').textContent = track.artist; $('#npAlbum').textContent = track.album || 'Single';
   $('#npFavorite').textContent = track.isFavorite ? '♥' : '♡';
 }
 function togglePlayback() {
@@ -523,13 +527,68 @@ function closeNowPlaying() {
   screen.classList.remove('presented'); screen.classList.add('closing'); clearTimeout(panelTimer);
   panelTimer = setTimeout(() => { screen.classList.add('hidden'); screen.classList.remove('closing'); }, 210);
 }
-function showSheet() { clearTimeout(window.zombieSheetTimer); const sheet = $('#sheet'); sheet.classList.remove('hidden', 'closing'); requestAnimationFrame(() => sheet.classList.add('shown')); }
+function showSheet() { clearTimeout(window.zombieSheetTimer); $('#sheetContent').scrollTop = 0; const sheet = $('#sheet'); sheet.classList.remove('hidden', 'closing'); requestAnimationFrame(() => sheet.classList.add('shown')); }
+function queueTrackMarkup(track, position, kind = 'upcoming') {
+  const canMoveUp = position > 0;
+  const state = kind === 'current' ? (audio.paused ? 'Ⅱ' : '▶') : String(position + 1).padStart(2, '0');
+  const controls = kind === 'current' ? '' : `<div class="queue-row-actions"><button data-queue-move="up" data-queue-id="${track.id}" aria-label="Move ${escapeHTML(track.title)} earlier" ${canMoveUp ? '' : 'disabled'}>↑</button><button data-queue-move="down" data-queue-id="${track.id}" aria-label="Move ${escapeHTML(track.title)} later">↓</button><button data-queue-remove="${track.id}" aria-label="Remove ${escapeHTML(track.title)} from queue">×</button></div>`;
+  return `<article class="queue-row ${kind === 'current' ? 'queue-current' : ''}"><button class="queue-jump" data-queue-jump="${track.id}" aria-label="Play ${escapeHTML(track.title)}"><span class="queue-state">${state}</span><span class="queue-row-art art-${artVariant(track)}" data-queue-art="${track.id}"></span><span class="queue-row-copy"><strong>${track.emoji} ${escapeHTML(track.title)}${kind === 'current' && !audio.paused ? '<span class="playing-bars" aria-label="Playing"><i></i><i></i><i></i></span>' : ''}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album || 'Single')}</small></span></button>${controls}</article>`;
+}
+function currentQueueTrack() { return tracks.find((track) => track.id === currentId); }
+function upcomingQueueIds() {
+  const valid = (id) => id !== currentId && tracks.some((track) => track.id === id);
+  return (shuffleOn ? shuffleBag : queue.slice(Math.max(0, queueIndex + 1))).filter(valid);
+}
+function queueArtworkInSheet() { document.querySelectorAll('#sheetContent [data-queue-art]').forEach((element) => applyArtwork(element, tracks.find((track) => track.id === element.dataset.queueArt))); }
+function saveQueueSession() { savePlayerState(true); updatePlayerMode(); }
 function openQueue() {
-  const queueTracks = queue.map((id) => tracks.find((track) => track.id === id)).filter(Boolean);
-  $('#sheetTitle').textContent = 'Up next';
-  $('#sheetContent').innerHTML = queueTracks.length ? queueTracks.map((track, index) => `<button class="sheet-option queue-item ${track.id === currentId ? 'queue-current' : ''}" data-queue-id="${track.id}"><span>${index === queueIndex ? '▶' : '·'}</span><span>${track.emoji} ${escapeHTML(track.title)}<small>${escapeHTML(track.artist)}</small></span></button>`).join('') : '<p class="sheet-note">Choose a song to start a queue.</p>';
-  document.querySelectorAll('[data-queue-id]').forEach((button) => { button.onclick = () => { closeSheet(); playTrack(button.dataset.queueId); }; });
+  const currentTrack = currentQueueTrack();
+  const upcoming = upcomingQueueIds().map((id) => tracks.find((track) => track.id === id)).filter(Boolean);
+  $('#sheetTitle').textContent = 'Queue';
+  $('#sheetContent').innerHTML = currentTrack ? `<div class="queue-summary"><span>${shuffleOn ? 'SHUFFLED ORDER' : 'PLAYBACK QUEUE'}</span><button id="clearUpcoming" ${upcoming.length ? '' : 'disabled'}>Clear upcoming</button></div><p class="sheet-section">NOW PLAYING</p>${queueTrackMarkup(currentTrack, 0, 'current')}${upcoming.length ? `<p class="sheet-section">UP NEXT</p>${queueTrackMarkup(upcoming[0], 0)}${upcoming.slice(1).length ? `<p class="sheet-section">REMAINING</p>${upcoming.slice(1).map((track, index) => queueTrackMarkup(track, index + 1)).join('')}` : ''}` : '<p class="sheet-note">No more songs are queued after this one.</p>'}` : '<p class="sheet-note">Choose a song to start a queue.</p>';
+  queueArtworkInSheet();
+  $('#clearUpcoming')?.addEventListener('click', clearUpcomingQueue);
+  document.querySelectorAll('#sheetContent [data-queue-jump]').forEach((button) => { button.onclick = () => { closeSheet(); void playQueuedTrack(button.dataset.queueJump); }; });
+  document.querySelectorAll('#sheetContent [data-queue-remove]').forEach((button) => { button.onclick = () => removeFromQueue(button.dataset.queueRemove); });
+  document.querySelectorAll('#sheetContent [data-queue-move]').forEach((button) => { button.onclick = () => moveQueueItem(button.dataset.queueId, button.dataset.queueMove); });
   showSheet();
+}
+async function playQueuedTrack(id) {
+  if (shuffleOn) {
+    const position = shuffleBag.indexOf(id);
+    if (position >= 0) { shuffleBag.splice(position, 1); if (currentId && currentId !== id) shuffleHistory.push(currentId); }
+  }
+  queueIndex = queue.indexOf(id); saveQueueSession();
+  await playTrack(id, null, { reason: 'queue-jump' });
+}
+function moveQueueItem(id, direction) {
+  const ids = shuffleOn ? shuffleBag : queue;
+  const from = ids.indexOf(id); const minimum = shuffleOn ? 0 : queueIndex + 1;
+  const to = direction === 'up' ? from - 1 : from + 1;
+  if (from < minimum || to < minimum || to >= ids.length) return;
+  [ids[from], ids[to]] = [ids[to], ids[from]]; saveQueueSession(); openQueue();
+}
+function removeFromQueue(id) {
+  if (id === currentId) { toast('The current song stays in the queue'); return; }
+  const removedIndex = queue.indexOf(id); queue = queue.filter((entry) => entry !== id); shuffleBag = shuffleBag.filter((entry) => entry !== id); shuffleHistory = shuffleHistory.filter((entry) => entry !== id);
+  if (!shuffleOn && removedIndex >= 0 && removedIndex < queueIndex) queueIndex -= 1;
+  saveQueueSession(); toast('Removed from queue'); openQueue();
+}
+function clearUpcomingQueue() {
+  const count = upcomingQueueIds().length;
+  if (!count || !confirm(`Clear ${count} upcoming ${count === 1 ? 'song' : 'songs'}? Your Library will not be changed.`)) return;
+  queue = currentId ? [currentId] : []; queueIndex = currentId ? 0 : -1; shuffleBag = []; shuffleHistory = [];
+  saveQueueSession(); toast('Upcoming queue cleared'); openQueue();
+}
+function addToQueue(trackId, playNext = false) {
+  const track = tracks.find((entry) => entry.id === trackId); if (!track) return;
+  if (!currentId) { void playTrack(trackId, [trackId], { reason: 'queue-start' }); toast('Started a new queue'); return; }
+  if (trackId === currentId) { toast('That song is already playing'); return; }
+  queue = queue.filter((id) => id !== trackId);
+  const currentIndex = queue.indexOf(currentId); if (currentIndex < 0) { queue.unshift(currentId); queueIndex = 0; } else queueIndex = currentIndex;
+  if (shuffleOn) { queue.push(trackId); shuffleBag = shuffleBag.filter((id) => id !== trackId); playNext ? shuffleBag.unshift(trackId) : shuffleBag.push(trackId); }
+  else { queue.splice(playNext ? queueIndex + 1 : queue.length, 0, trackId); }
+  saveQueueSession(); toast(playNext ? 'Will play next' : 'Added to the queue');
 }
 
 async function metadataFor(file) {
@@ -641,13 +700,34 @@ function closeSheet() {
 function openSongOptions(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = track.title;
-  $('#sheetContent').innerHTML = `<button class="sheet-option" data-action="favorite">${track.isFavorite ? 'Remove from favorites' : 'Add to favorites'}</button><button class="sheet-option" data-action="playlist">Add or remove from playlist</button><button class="sheet-option" data-action="edit">Edit song information</button><button class="sheet-option" data-action="details">Song details</button><button class="sheet-option danger-text" data-action="delete">Delete song</button>`;
+  $('#sheetContent').innerHTML = `<div class="sheet-song-header"><span class="sheet-song-art art-${artVariant(track)}" data-sheet-art="${track.id}"></span><span><strong>${track.emoji} ${escapeHTML(track.title)}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album || 'Single')}</small></span></div><p class="sheet-section">SONG</p><button class="sheet-option" data-action="favorite">${track.isFavorite ? '♥ Remove from favorites' : '♡ Add to favorites'}</button><button class="sheet-option" data-action="play-next">Play next</button><button class="sheet-option" data-action="queue">Add to queue</button><button class="sheet-option" data-action="playlist">Add or remove from playlist</button><p class="sheet-section">EDIT</p><button class="sheet-option" data-action="edit">Edit song information</button><button class="sheet-option" data-action="artwork">Change artwork</button><button class="sheet-option" data-action="details">Song details</button><p class="sheet-section">BROWSE</p><button class="sheet-option" data-action="album">Go to album</button><button class="sheet-option" data-action="artist">Go to artist</button><button class="sheet-option" data-action="share">Share local file</button><p class="sheet-section">DEVICE</p><button class="sheet-option danger-text" data-action="delete">Delete song from this iPhone</button>`;
+  applyArtwork($('#sheetContent [data-sheet-art]'), track);
   $('#sheetContent').querySelector('[data-action="favorite"]').onclick = async () => { await toggleFavorite(id); closeSheet(); };
+  $('#sheetContent').querySelector('[data-action="play-next"]').onclick = () => { addToQueue(id, true); closeSheet(); };
+  $('#sheetContent').querySelector('[data-action="queue"]').onclick = () => { addToQueue(id); closeSheet(); };
   $('#sheetContent').querySelector('[data-action="playlist"]').onclick = () => openPlaylistSheet(id);
   $('#sheetContent').querySelector('[data-action="edit"]').onclick = () => openSongEditor(id);
+  $('#sheetContent').querySelector('[data-action="artwork"]').onclick = () => { artTarget = { type: 'track', id }; closeSheet(); $('#artInput').click(); };
   $('#sheetContent').querySelector('[data-action="details"]').onclick = () => openSongDetails(id);
+  $('#sheetContent').querySelector('[data-action="album"]').onclick = () => goToCollection('album', track.album || 'Single');
+  $('#sheetContent').querySelector('[data-action="artist"]').onclick = () => goToCollection('artist', track.artist || 'Unknown artist');
+  $('#sheetContent').querySelector('[data-action="share"]').onclick = () => { void shareTrack(track); };
   $('#sheetContent').querySelector('[data-action="delete"]').onclick = () => { closeSheet(); deleteTrack(id); };
   showSheet();
+}
+function goToCollection(type, value) {
+  currentView = 'songs'; activePlaylistId = null; collectionFilter = { type, value }; closeSheet(); render();
+}
+async function shareTrack(track) {
+  try {
+    const blob = await getAudioBlob(track.id);
+    if (!blob) { toast('This local file is missing from Zombie'); return; }
+    const safeName = (track.fileName || `${track.title}.mp3`).replace(/[\\/:*?"<>|]+/g, '-');
+    const file = new File([blob], safeName, { type: blob.type || track.type || 'audio/mpeg' });
+    const payload = { title: track.title, text: `${track.artist} · ${track.album || 'Single'}`, files: [file] };
+    if (!navigator.share || (navigator.canShare && !navigator.canShare({ files: [file] }))) { toast('Sharing local files is unavailable in this browser'); return; }
+    await navigator.share(payload);
+  } catch (error) { if (error?.name !== 'AbortError') toast('Zombie could not share that local file'); }
 }
 function openSongDetails(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
@@ -731,24 +811,27 @@ function wireUI() {
   $('#npFavorite').onclick = () => currentId && toggleFavorite(currentId); $('#npMore').onclick = () => currentId && openSongOptions(currentId); $('#queueButton').onclick = openQueue;
   $('#sheetClose').onclick = closeSheet; $('#sheet').onclick = (event) => { if (event.target === $('#sheet')) closeSheet(); };
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
-  audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#currentTime').textContent = formatTime(audio.currentTime); updateMediaPosition(); savePlayerState(); };
-  audio.onloadedmetadata = () => { $('#duration').textContent = formatTime(audio.duration); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
+  audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#currentTime').textContent = formatTime(audio.currentTime); $('#remainingTime').textContent = formatRemainingTime((audio.duration || 0) - (audio.currentTime || 0)); updateMediaPosition(); savePlayerState(); };
+  audio.onloadedmetadata = () => { $('#remainingTime').textContent = formatRemainingTime(audio.duration); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
   audio.onplay = () => { $('#miniPlayer').classList.remove('loading'); $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; const track = tracks.find((entry) => entry.id === currentId); if (track && countedSerial !== playbackSerial) { countedSerial = playbackSerial; track.playCount = (track.playCount || 0) + 1; track.lastPlayed = Date.now(); saveRecord('tracks', track).catch(() => {}); } releaseRetiredAudioUrls('replacement playing'); playbackDebug('play-event', { next: trackDebug(track) }); updateMediaSession(track); render(); };
   audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
   audio.onended = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
   audio.onerror = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track) }); $('#miniPlayer').classList.remove('loading'); if (!cancelPendingAudioReady && currentId && (audio.src === currentUrl || audio.currentSrc === currentUrl)) { setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); } };
   ['waiting', 'stalled', 'suspend', 'emptied', 'abort', 'canplay'].forEach((eventName) => audio.addEventListener(eventName, () => playbackDebug(`audio-${eventName}`)));
-  let miniTouch = null, fullTouchY = null;
+  let miniTouch = null, fullTouchY = null, sheetTouchY = null;
   $('#miniPlayer').addEventListener('touchstart', (event) => { if (event.target.closest('#miniPrevious,#miniPlay,#miniNext')) { miniTouch = null; return; } const touch = event.changedTouches[0]; miniTouch = touch ? { x: touch.clientX, y: touch.clientY, direction: null } : null; }, { passive: true });
   $('#miniPlayer').addEventListener('touchmove', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; if (!miniTouch.direction && Math.max(Math.abs(dx), Math.abs(dy)) > 8) miniTouch.direction = Math.abs(dx) > Math.abs(dy) * 1.25 ? 'horizontal' : 'vertical'; if (miniTouch.direction === 'horizontal') { const offset = Math.max(-30, Math.min(30, dx * 0.22)); $('#miniPlayer').style.transform = `translateX(${offset}px)`; $('#miniPlayer').classList.add('swiping'); } }, { passive: true });
   $('#miniPlayer').addEventListener('touchend', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; $('#miniPlayer').style.transform = ''; $('#miniPlayer').classList.remove('swiping'); if (miniTouch.direction === 'horizontal' && Math.abs(dx) > 68) { dx < 0 ? nextTrack() : previousTrack(); } else if (miniTouch.direction !== 'horizontal' && dy < -40 && Math.abs(dy) > Math.abs(dx)) openNowPlaying(); miniTouch = null; }, { passive: true });
   $('#nowPlayingScreen').addEventListener('touchstart', (event) => { fullTouchY = event.target.closest('button,input') ? null : event.changedTouches[0]?.clientY ?? null; }, { passive: true });
   $('#nowPlayingScreen').addEventListener('touchend', (event) => { const endY = event.changedTouches[0]?.clientY; if (fullTouchY !== null && endY - fullTouchY > 70) closeNowPlaying(); fullTouchY = null; }, { passive: true });
+  const sheetCard = $('#sheet .sheet-card');
+  sheetCard.addEventListener('touchstart', (event) => { sheetTouchY = $('#sheetContent').scrollTop <= 0 && !event.target.closest('button,input') ? event.changedTouches[0]?.clientY ?? null : null; }, { passive: true });
+  sheetCard.addEventListener('touchend', (event) => { const endY = event.changedTouches[0]?.clientY; if (sheetTouchY !== null && endY - sheetTouchY > 76) closeSheet(); sheetTouchY = null; }, { passive: true });
 }
 async function initialise() {
   try {
-    await openDatabase(); await loadLibrary(); await restorePlayerState(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#duration').textContent = formatTime(track.duration); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=15').catch(() => {});
+    await openDatabase(); await loadLibrary(); await restorePlayerState(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=16').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
