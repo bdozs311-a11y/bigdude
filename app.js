@@ -17,7 +17,7 @@ let artTarget = null, lyricsTarget = null, visualTarget = null, activeLyricsId =
 let lyricsSyncDraft = null, lyricsManualScrollUntil = 0, lyricsAutoScrollUntil = 0;
 const artworkUrls = new Map();
 const visualUrls = new Map();
-let panelTimer = null;
+let panelTimer = null, lastVisualTrackId = null, visualTransitionToken = 0, activePaletteSignature = '';
 let restoredPosition = 0, lastStateSaveAt = 0;
 let pendingBackup = null;
 const BACKUP_FORMAT = 'zombie-backup';
@@ -45,7 +45,14 @@ const rgbValue = (color) => color.map(clampByte).join(',');
 function applyAmbientPalette(track = tracks.find((entry) => entry.id === currentId)) {
   const palette = isPalette(track?.palette) ? track.palette : fallbackPaletteFor(track);
   const root = document.documentElement;
-  root.style.setProperty('--zombie-accent-rgb', rgbValue(palette.accent)); root.style.setProperty('--zombie-glow-rgb', rgbValue(palette.glow));
+  const accent = rgbValue(palette.accent), glow = rgbValue(palette.glow), signature = `${accent}|${glow}`;
+  const transition = $('#ambientTransition');
+  if (activePaletteSignature && activePaletteSignature !== signature && transition) {
+    const [previousAccent, previousGlow] = activePaletteSignature.split('|');
+    transition.style.setProperty('--zombie-previous-accent-rgb', previousAccent); transition.style.setProperty('--zombie-previous-glow-rgb', previousGlow);
+    transition.classList.remove('morphing'); void transition.offsetWidth; transition.classList.add('morphing');
+  }
+  root.style.setProperty('--zombie-accent-rgb', accent); root.style.setProperty('--zombie-glow-rgb', glow); activePaletteSignature = signature;
   root.dataset.zombiePalette = track?.id || 'default';
   if (track?.artworkId && !isPalette(track.palette)) void deriveArtworkPalette(track);
 }
@@ -896,17 +903,27 @@ async function playTrack(id, sourceIds = null, options = {}) {
   }
 }
 function showMiniPlayer(track) { $('#miniPlayer').classList.remove('hidden'); syncNowPlaying(track); }
-function syncNowPlaying(track = tracks.find((entry) => entry.id === currentId)) {
-  if (!track) return;
-  ['#miniPlayer', '#nowPlayingScreen'].forEach((selector) => {
-    const panel = $(selector); panel.classList.remove('song-changing', 'artwork-changing');
-    requestAnimationFrame(() => { panel.classList.add('song-changing', 'artwork-changing'); });
-  });
+function paintNowPlayingTrack(track, changed = false) {
   applyAmbientPalette(track); $('#nowTitle').textContent = track.title; $('#nowArtist').textContent = track.artist;
   applyArtwork($('#miniArt'), track); applyArtwork($('#npArt'), track); applyArtwork($('#npBackdrop'), track);
   $('#npEmoji').textContent = track.emoji; setMarqueeText('#npTitle', track.title); setMarqueeText('#npArtist', track.artist); $('#npAlbum').textContent = track.album || 'Single';
-  $('#npFavorite').textContent = track.isFavorite ? '♥' : '♡';
-  syncAmbientMotionState(); void syncNowPlayingVisual(track);
+  $('#npFavorite').textContent = track.isFavorite ? '♥' : '♡'; syncAmbientMotionState(); void syncNowPlayingVisual(track);
+  if (changed) {
+    ['#miniPlayer', '#nowPlayingScreen'].forEach((selector) => {
+      const panel = $(selector); panel.classList.remove('track-leaving', 'song-changing', 'artwork-changing');
+      requestAnimationFrame(() => panel.classList.add('song-changing', 'artwork-changing'));
+    });
+  }
+}
+function syncNowPlaying(track = tracks.find((entry) => entry.id === currentId)) {
+  if (!track) return;
+  const changed = Boolean(lastVisualTrackId && lastVisualTrackId !== track.id); lastVisualTrackId = track.id;
+  const token = ++visualTransitionToken;
+  if (changed) {
+    $('#npSeek').value = 0; $('#npSeek').style.setProperty('--seek-progress', '0%'); $('#miniPlayer').style.setProperty('--mini-progress', '0%');
+    ['#miniPlayer', '#nowPlayingScreen'].forEach((selector) => { const panel = $(selector); panel.classList.remove('song-changing', 'artwork-changing'); panel.classList.add('track-leaving'); });
+    window.setTimeout(() => { if (token === visualTransitionToken) paintNowPlayingTrack(track, true); }, 92);
+  } else paintNowPlayingTrack(track);
 }
 function togglePlayback() {
   if (!audio.src && currentId) { playTrack(currentId); return; }
@@ -994,17 +1011,23 @@ function updatePlayerMode() {
   $('#repeatButton').setAttribute('aria-label', `Repeat ${repeatMode}`);
   savePlayerState(true);
 }
+function setMiniPlayerTransitionOrigin(screen) {
+  const miniArt = $('#miniArt'), stage = $('#npArtStage'); if (!miniArt || !stage) return;
+  const mini = miniArt.getBoundingClientRect(), full = stage.getBoundingClientRect(); if (!mini.width || !full.width) return;
+  const x = (mini.left + (mini.width / 2)) - (full.left + (full.width / 2)); const y = (mini.top + (mini.height / 2)) - (full.top + (full.height / 2));
+  screen.style.setProperty('--mini-origin-x', `${x}px`); screen.style.setProperty('--mini-origin-y', `${y}px`); screen.style.setProperty('--mini-origin-scale', String(Math.max(.1, Math.min(.32, mini.width / full.width))));
+}
 function openNowPlaying() {
   if (!currentId) return;
-  clearTimeout(panelTimer); const screen = $('#nowPlayingScreen'); screen.classList.remove('hidden', 'closing');
+  clearTimeout(panelTimer); const screen = $('#nowPlayingScreen'), mini = $('#miniPlayer'); screen.classList.remove('hidden', 'closing'); screen.classList.add('from-mini');
   syncModalScrollLock();
-  requestAnimationFrame(() => { screen.classList.add('presented'); syncNowPlaying(tracks.find((entry) => entry.id === currentId)); void syncNowPlayingVisual(); });
+  requestAnimationFrame(() => { setMiniPlayerTransitionOrigin(screen); requestAnimationFrame(() => { mini.classList.add('expanding'); screen.classList.add('presented'); syncNowPlaying(tracks.find((entry) => entry.id === currentId)); void syncNowPlayingVisual(); }); });
 }
 function closeNowPlaying() {
   const screen = $('#nowPlayingScreen'); if (screen.classList.contains('hidden')) return;
-  stopNowPlayingVisual();
+  stopNowPlayingVisual(); setMiniPlayerTransitionOrigin(screen);
   screen.classList.remove('presented'); screen.classList.add('closing'); clearTimeout(panelTimer);
-  panelTimer = setTimeout(() => { screen.classList.add('hidden'); screen.classList.remove('closing'); syncModalScrollLock(); }, 210);
+  panelTimer = setTimeout(() => { screen.classList.add('hidden'); screen.classList.remove('closing', 'from-mini'); $('#miniPlayer').classList.remove('expanding'); syncModalScrollLock(); }, 360);
 }
 function syncModalScrollLock() { document.body.classList.toggle('zombie-modal-open', ['#nowPlayingScreen', '#lyricsScreen', '#sheet'].some((selector) => !$(selector).classList.contains('hidden'))); }
 function showSheet() { clearTimeout(window.zombieSheetTimer); $('#sheetContent').scrollTop = 0; const sheet = $('#sheet'); sheet.classList.remove('hidden', 'closing'); syncModalScrollLock(); requestAnimationFrame(() => sheet.classList.add('shown')); }
@@ -1389,7 +1412,7 @@ function wireUI() {
 async function initialise() {
   try {
     await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=26').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=27').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
