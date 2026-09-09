@@ -19,12 +19,27 @@ let lyricsSyncDraft = null, lyricsManualScrollUntil = 0, lyricsAutoScrollUntil =
 const artworkUrls = new Map();
 const visualUrls = new Map();
 let panelTimer = null, lastVisualTrackId = null, visualTransitionToken = 0, activePaletteSignature = '';
-let sleepTimerHandle = null, sleepTimerEndsAt = 0, playlistDragTrackId = null;
+let sleepTimerHandle = null, sleepTimerEndsAt = 0, sleepAfterCurrent = false, playlistDragTrackId = null;
 let restoredPosition = 0, lastStateSaveAt = 0;
 let pendingBackup = null;
 const BACKUP_FORMAT = 'zombie-backup';
 const FULL_BACKUP_LIMIT = 40 * 1024 * 1024;
-const preferences = { layout: 'comfortable', appearance: 'soft', visualMode: 'artwork', playbackRate: 1, sort: 'recent' };
+const preferences = { layout: 'comfortable', appearance: 'soft', visualMode: 'artwork', playbackRate: 1, sort: 'recent', dynamicColours: 'balanced', colourIntensity: 'medium', zombieAccent: 'purple', visualEffects: true };
+const AUDIO_MOD_DEFAULTS = { bass: 0, treble: 0, vocal: 'off', reverb: 'off', speed: 1, pitch: 0, eq: { bass: 0, lowMid: 0, mid: 0, highMid: 0, treble: 0 }, remember: true };
+const AUDIO_PRESETS = {
+  normal: { label: 'Normal', values: {} },
+  bass: { label: 'Bass Boosted', values: { bass: 52, eq: { bass: 4, lowMid: 2 } } },
+  slowed: { label: 'Slowed', values: { speed: .85 } },
+  slowedReverb: { label: 'Slowed + Reverb', values: { speed: .85, reverb: 'medium' } },
+  nightcore: { label: 'Nightcore', values: { speed: 1.25 } },
+  vocal: { label: 'Vocal', values: { vocal: 'high', eq: { mid: 3, highMid: 4, bass: -2 } } },
+  car: { label: 'Car', values: { bass: 40, eq: { bass: 4, lowMid: 2, treble: 1 } } },
+  speaker: { label: 'Speaker', values: { bass: 20, eq: { bass: 2, lowMid: 1, highMid: 2, treble: 1 } } },
+  soft: { label: 'Soft', values: { treble: -14, eq: { mid: 1, highMid: -2, treble: -3 } } },
+};
+const ZOMBIE_ACCENTS = { purple: { accent: [150, 91, 255], glow: [245, 91, 192] }, pink: { accent: [245, 86, 180], glow: [255, 156, 205] }, red: { accent: [244, 83, 92], glow: [255, 151, 112] }, blue: { accent: [74, 151, 255], glow: [89, 224, 255] }, green: { accent: [75, 206, 151], glow: [155, 245, 171] }, orange: { accent: [246, 145, 64], glow: [255, 205, 100] } };
+let audioMods = { ...AUDIO_MOD_DEFAULTS, eq: { ...AUDIO_MOD_DEFAULTS.eq } }, customAudioPresets = [];
+let audioGraph = null, audioModsRestored = false;
 
 const randomEmoji = () => EMOJIS[Math.floor(Math.random() * EMOJIS.length)];
 const neutralArtist = (value) => {
@@ -49,7 +64,7 @@ const isPalette = (value) => Array.isArray(value?.accent) && value.accent.length
 const fallbackPaletteFor = (track) => FALLBACK_PALETTES[artVariant(track || { title: 'Zombie' }) % FALLBACK_PALETTES.length];
 const rgbValue = (color) => color.map(clampByte).join(',');
 function applyAmbientPalette(track = tracks.find((entry) => entry.id === currentId)) {
-  const palette = isPalette(track?.palette) ? track.palette : fallbackPaletteFor(track);
+  const palette = preferences.dynamicColours === 'off' ? (ZOMBIE_ACCENTS[preferences.zombieAccent] || ZOMBIE_ACCENTS.purple) : (isPalette(track?.palette) ? track.palette : fallbackPaletteFor(track));
   const root = document.documentElement;
   const accent = rgbValue(palette.accent), glow = rgbValue(palette.glow), signature = `${accent}|${glow}`;
   const transition = $('#ambientTransition');
@@ -59,8 +74,11 @@ function applyAmbientPalette(track = tracks.find((entry) => entry.id === current
     transition.classList.remove('morphing'); void transition.offsetWidth; transition.classList.add('morphing');
   }
   root.style.setProperty('--zombie-accent-rgb', accent); root.style.setProperty('--zombie-glow-rgb', glow); activePaletteSignature = signature;
+  root.dataset.zombieColourMode = preferences.dynamicColours;
+  root.dataset.zombieColourIntensity = preferences.colourIntensity;
+  root.dataset.zombieVisualEffects = preferences.visualEffects ? 'on' : 'off';
   root.dataset.zombiePalette = track?.id || 'default';
-  if (track?.artworkId && !isPalette(track.palette)) void deriveArtworkPalette(track);
+  if (preferences.dynamicColours !== 'off' && track?.artworkId && !isPalette(track.palette)) void deriveArtworkPalette(track);
 }
 function liftPaletteColor(color, floor = 58) { return color.map((value) => clampByte(Math.max(floor, (Number(value) * .84) + 31))); }
 async function deriveArtworkPalette(track) {
@@ -82,7 +100,7 @@ async function deriveArtworkPalette(track) {
       const light = (r + g + b) / 765; if (alpha < 120 || light < .075 || light > .94) continue;
       red += r; green += g; blue += b; count += 1;
       const saturation = (Math.max(r, g, b) - Math.min(r, g, b)) / 255;
-      const score = saturation * (1 - Math.abs(light - .52)); if (score > bestScore) { bestScore = score; best = [r, g, b]; }
+      const score = saturation * saturation * (1 - Math.abs(light - .52)); if (saturation > .13 && score > bestScore) { bestScore = score; best = [r, g, b]; }
     }
     if (!count) return;
     const average = [red / count, green / count, blue / count];
@@ -221,6 +239,10 @@ function applyPreferences() {
   $('#visualStatus') && ($('#visualStatus').textContent = preferences.visualMode === 'animation' ? 'Animation when a song has one' : 'Artwork by default');
   $('#visualButton') && ($('#visualButton').textContent = preferences.visualMode === 'animation' ? '◇ Animation' : '◇ Artwork');
   $('#visualButton')?.classList.toggle('active', preferences.visualMode === 'animation');
+  $('#dynamicColoursStatus') && ($('#dynamicColoursStatus').textContent = preferences.dynamicColours === 'full' ? 'Full artwork colour' : preferences.dynamicColours === 'minimal' ? 'Minimal colour' : preferences.dynamicColours === 'off' ? `Off · ${ZOMBIE_ACCENTS[preferences.zombieAccent] ? preferences.zombieAccent[0].toUpperCase() + preferences.zombieAccent.slice(1) : 'Purple'}` : 'Balanced');
+  $('#colourIntensityStatus') && ($('#colourIntensityStatus').textContent = preferences.colourIntensity[0].toUpperCase() + preferences.colourIntensity.slice(1));
+  $('#visualEffectsStatus') && ($('#visualEffectsStatus').textContent = preferences.visualEffects ? 'On · subtle only' : 'Off');
+  applyAmbientPalette();
 }
 async function restorePreferences() {
   const record = await getRecord('settings', 'appPreferences').catch(() => null);
@@ -230,6 +252,10 @@ async function restorePreferences() {
     if (['artwork', 'animation'].includes(record.visualMode)) preferences.visualMode = record.visualMode;
     if ([0.8, 1, 1.2, 1.5].includes(record.playbackRate)) preferences.playbackRate = record.playbackRate;
     if (['recent', 'oldest', 'title', 'artist', 'album', 'plays', 'least', 'duration', 'played'].includes(record.sort)) preferences.sort = record.sort;
+    if (['full', 'balanced', 'minimal', 'off'].includes(record.dynamicColours)) preferences.dynamicColours = record.dynamicColours;
+    if (['low', 'medium', 'high'].includes(record.colourIntensity)) preferences.colourIntensity = record.colourIntensity;
+    if (ZOMBIE_ACCENTS[record.zombieAccent]) preferences.zombieAccent = record.zombieAccent;
+    if (typeof record.visualEffects === 'boolean') preferences.visualEffects = record.visualEffects;
   }
   applyPreferences();
 }
@@ -518,11 +544,102 @@ async function importLyricsFile(file) {
     closeSheet(); if (activeLyricsId === id) renderLyrics(track); toast(syncedLyrics.length ? 'Synced LRC lyrics imported' : 'Lyrics imported offline');
   } catch (error) { toast(error.message || 'Zombie could not read those lyrics'); }
 }
+function cloneAudioMods(value = audioMods) { return { ...AUDIO_MOD_DEFAULTS, ...value, eq: { ...AUDIO_MOD_DEFAULTS.eq, ...(value?.eq || {}) } }; }
+function isAppleMobileAudio() { return /iPad|iPhone|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); }
+function supportsLiveAudioProcessing() { return !isAppleMobileAudio() && Boolean(window.AudioContext || window.webkitAudioContext); }
+function audioModsNeedProcessor(mods = audioMods) { return Boolean(mods.bass || mods.treble || mods.vocal !== 'off' || mods.reverb !== 'off' || Object.values(mods.eq || {}).some(Boolean)); }
+function audioModsAreActive() { return Math.abs((audioMods.speed || 1) - 1) > .001 || (supportsLiveAudioProcessing() && audioModsNeedProcessor()); }
+function updateAudioModsIndicator() {
+  const button = $('#audioModsButton'); if (!button) return;
+  const active = audioModsAreActive(); button.classList.toggle('active', active); button.classList.toggle('audio-mods-on', active); button.textContent = active ? '◌ Audio • On' : '◌ Audio';
+}
+function setGraphValue(node, value) { if (!node) return; const now = audioGraph?.context?.currentTime || 0; node.gain.cancelScheduledValues(now); node.gain.linearRampToValueAtTime(value, now + .035); }
+function createReverbImpulse(context) {
+  const length = Math.max(1, Math.floor(context.sampleRate * .72)); const impulse = context.createBuffer(2, length, context.sampleRate);
+  for (let channel = 0; channel < impulse.numberOfChannels; channel += 1) { const data = impulse.getChannelData(channel); for (let index = 0; index < length; index += 1) data[index] = (Math.random() * 2 - 1) * Math.pow(1 - index / length, 3.1); }
+  return impulse;
+}
+function ensureAudioGraph({ resume = false } = {}) {
+  if (!supportsLiveAudioProcessing()) return false;
+  try {
+    if (!audioGraph) {
+      const Context = window.AudioContext || window.webkitAudioContext; const context = new Context();
+      const source = context.createMediaElementSource(audio);
+      const bass = context.createBiquadFilter(); bass.type = 'lowshelf'; bass.frequency.value = 105;
+      const lowMid = context.createBiquadFilter(); lowMid.type = 'peaking'; lowMid.frequency.value = 310; lowMid.Q.value = .8;
+      const mid = context.createBiquadFilter(); mid.type = 'peaking'; mid.frequency.value = 1000; mid.Q.value = .9;
+      const highMid = context.createBiquadFilter(); highMid.type = 'peaking'; highMid.frequency.value = 3200; highMid.Q.value = .95;
+      const treble = context.createBiquadFilter(); treble.type = 'highshelf'; treble.frequency.value = 7100;
+      const vocal = context.createBiquadFilter(); vocal.type = 'peaking'; vocal.frequency.value = 2350; vocal.Q.value = 1.05;
+      const dry = context.createGain(); const reverb = context.createConvolver(); const wet = context.createGain();
+      reverb.buffer = createReverbImpulse(context); source.connect(bass).connect(lowMid).connect(mid).connect(highMid).connect(treble).connect(vocal); vocal.connect(dry).connect(context.destination); vocal.connect(reverb).connect(wet).connect(context.destination);
+      audioGraph = { context, source, filters: { bass, lowMid, mid, highMid, treble, vocal }, wet };
+    }
+    if (resume && audioGraph.context.state === 'suspended') void audioGraph.context.resume().catch(() => {});
+    return true;
+  } catch (error) { console.warn('[Zombie Audio Mods] Web Audio unavailable; direct playback kept active.', error); return false; }
+}
+function applyAudioModGraph() {
+  if (!audioGraph) return;
+  setGraphValue(audioGraph.filters.bass, (Number(audioMods.bass) || 0) * .14 + (Number(audioMods.eq.bass) || 0));
+  setGraphValue(audioGraph.filters.lowMid, Number(audioMods.eq.lowMid) || 0);
+  setGraphValue(audioGraph.filters.mid, Number(audioMods.eq.mid) || 0);
+  setGraphValue(audioGraph.filters.highMid, Number(audioMods.eq.highMid) || 0);
+  setGraphValue(audioGraph.filters.treble, (Number(audioMods.treble) || 0) * .2 + (Number(audioMods.eq.treble) || 0));
+  const vocalGain = { off: 0, low: 1.5, medium: 3, high: 4.7 }[audioMods.vocal] ?? 0; setGraphValue(audioGraph.filters.vocal, vocalGain);
+  const wet = { off: 0, light: .10, medium: .19, strong: .28 }[audioMods.reverb] ?? 0; setGraphValue(audioGraph.wet, wet);
+}
+function applyAudioMods({ userGesture = false } = {}) {
+  const speed = Math.min(2, Math.max(.5, Number(audioMods.speed) || 1)); audioMods.speed = speed; preferences.playbackRate = speed; audio.playbackRate = speed;
+  if (audioModsNeedProcessor() && supportsLiveAudioProcessing() && userGesture) {
+    if (ensureAudioGraph({ resume: true })) applyAudioModGraph();
+    else { audioMods = { ...cloneAudioMods(), bass: 0, treble: 0, vocal: 'off', reverb: 'off', eq: { ...AUDIO_MOD_DEFAULTS.eq } }; toast('Live effects are unavailable here; original playback is still safe'); }
+  } else if (audioGraph) applyAudioModGraph();
+  updateAudioModsIndicator(); updateMediaPosition();
+}
+function saveAudioMods() { saveRecord('settings', { key: 'audioMods', ...cloneAudioMods() }).catch(() => {}); savePreferences(); updateAudioModsIndicator(); }
+async function restoreAudioMods() {
+  const [stored, savedPresets] = await Promise.all([getRecord('settings', 'audioMods').catch(() => null), getRecord('settings', 'customAudioPresets').catch(() => null)]);
+  const legacySpeed = preferences.playbackRate || 1;
+  if (stored) { audioMods = cloneAudioMods(stored.remember === false ? { remember: false, speed: 1 } : stored); }
+  else audioMods = cloneAudioMods({ speed: legacySpeed });
+  customAudioPresets = Array.isArray(savedPresets?.presets) ? savedPresets.presets.filter((preset) => preset?.id && preset?.name && preset?.values).slice(0, 24).map((preset) => ({ id: String(preset.id), name: String(preset.name).slice(0, 42), values: cloneAudioMods(preset.values) })) : [];
+  audioModsRestored = true; applyAudioMods();
+}
+function resetAudioMods() {
+  const remember = audioMods.remember; audioMods = cloneAudioMods({ remember }); applyAudioMods({ userGesture: true }); saveAudioMods(); toast('Audio Mods reset'); openAudioMods();
+}
+function mergeAudioModValues(values = {}) { return cloneAudioMods({ ...AUDIO_MOD_DEFAULTS, ...values, remember: audioMods.remember, eq: { ...AUDIO_MOD_DEFAULTS.eq, ...(values.eq || {}) } }); }
+function applyAudioPreset(key, values, label) {
+  audioMods = mergeAudioModValues(values);
+  if (!supportsLiveAudioProcessing() && audioModsNeedProcessor()) { audioMods.bass = 0; audioMods.treble = 0; audioMods.vocal = 'off'; audioMods.reverb = 'off'; audioMods.eq = { ...AUDIO_MOD_DEFAULTS.eq }; toast(`${label}: safe speed setting applied`); }
+  applyAudioMods({ userGesture: true }); saveAudioMods(); openAudioMods();
+}
+async function saveCustomAudioPreset() {
+  const name = prompt('Name this Audio Mods preset'); if (!name?.trim()) return;
+  const existing = customAudioPresets.findIndex((preset) => preset.name.toLowerCase() === name.trim().toLowerCase()); const preset = { id: existing >= 0 ? customAudioPresets[existing].id : crypto.randomUUID(), name: name.trim().slice(0, 42), values: cloneAudioMods() };
+  if (existing >= 0) customAudioPresets.splice(existing, 1, preset); else customAudioPresets.push(preset);
+  await saveRecord('settings', { key: 'customAudioPresets', presets: customAudioPresets }); toast('Custom Audio preset saved'); openAudioMods();
+}
+async function deleteCustomAudioPreset(id) { const preset = customAudioPresets.find((entry) => entry.id === id); if (!preset || !confirm(`Delete “${preset.name}”?`)) return; customAudioPresets = customAudioPresets.filter((entry) => entry.id !== id); await saveRecord('settings', { key: 'customAudioPresets', presets: customAudioPresets }); toast('Custom preset deleted'); openAudioMods(); }
+function updateAudioModRange(key, value) { audioMods[key] = Number(value); applyAudioMods({ userGesture: true }); saveAudioMods(); }
+function updateAudioEq(key, value) { audioMods.eq[key] = Number(value); applyAudioMods({ userGesture: true }); saveAudioMods(); }
 function openAudioMods() {
-  $('#audioModsButton').classList.add('active');
-  $('#sheetTitle').textContent = 'Audio';
-  $('#sheetContent').innerHTML = `<p class="sheet-note">Speed changes playback only — your files are never changed. Live EQ, reverb, and pitch processing stay off because Web Audio can make iPhone background playback less reliable.</p><p class="sheet-section">PLAYBACK SPEED</p>${[0.8, 1, 1.2, 1.5].map((rate) => `<button class="sheet-option ${preferences.playbackRate === rate ? 'selected-option' : ''}" data-rate="${rate}">${rate === 1 ? 'Normal · 1×' : `${rate}×`}</button>`).join('')}`;
-  $('#sheetContent').querySelectorAll('[data-rate]').forEach((button) => { button.onclick = () => { preferences.playbackRate = Number(button.dataset.rate); audio.playbackRate = preferences.playbackRate; savePreferences(); updateMediaPosition(); closeSheet(); toast(preferences.playbackRate === 1 ? 'Original sound restored' : `Playback speed: ${preferences.playbackRate}×`); }; });
+  const processing = supportsLiveAudioProcessing(); const active = audioModsAreActive();
+  $('#audioModsButton').classList.add('active'); $('#sheetTitle').textContent = 'Audio Mods';
+  const slider = (label, key, min, max, value, suffix = '') => `<label class="audio-mod-slider"><span><strong>${label}</strong><output id="${key}Value">${value}${suffix}</output></span><input id="${key}Control" type="range" min="${min}" max="${max}" value="${value}" ${processing ? '' : 'disabled'}></label>`;
+  const eq = [['Bass', 'bass'], ['Low Mid', 'lowMid'], ['Mid', 'mid'], ['High Mid', 'highMid'], ['Treble', 'treble']];
+  $('#sheetContent').innerHTML = `<section class="audio-mod-hero ${active ? 'is-active' : ''}"><i>◌</i><span><strong>${active ? 'Audio Mods are on' : 'Original sound'}</strong><small>${processing ? 'Effects play locally and never change your files.' : 'iPhone safe mode keeps background playback direct.'}</small></span><button id="resetAudioMods">Reset</button></section>${processing ? '' : '<p class="audio-safe-note">Bass, EQ, vocal enhancement and reverb are disabled in iPhone Home Screen mode to protect reliable lock-screen and background playback. Native speed still works.</p>'}<p class="sheet-section">PRESETS</p><div class="audio-preset-grid">${Object.entries(AUDIO_PRESETS).map(([key, preset]) => `<button class="audio-preset ${key === 'normal' && !active ? 'selected' : ''}" data-audio-preset="${key}"><i>${key === 'bass' ? '▂▅' : key === 'slowedReverb' ? '⌁' : key === 'nightcore' ? '⚡' : key === 'vocal' ? '◌' : key === 'car' ? '▰' : key === 'soft' ? '☾' : '♫'}</i>${preset.label}</button>`).join('')}</div><p class="sheet-section">PLAYBACK</p><div class="audio-speed-row">${[.5,.75,.85,1,1.15,1.25,1.5,1.75,2].map((rate) => `<button class="audio-speed ${audioMods.speed === rate ? 'selected-option' : ''}" data-audio-speed="${rate}">${rate}×</button>`).join('')}</div><p class="sheet-section">LIVE EFFECTS</p>${slider('Bass Boost', 'bass', 0, 100, audioMods.bass, '%')}${slider('Treble', 'treble', -50, 50, audioMods.treble)}<div class="audio-choice"><span><strong>Vocal Boost</strong><small>EQ-style clarity, not vocal isolation.</small></span><div>${['off','low','medium','high'].map((value) => `<button data-vocal="${value}" class="${audioMods.vocal === value ? 'selected-option' : ''}" ${processing ? '' : 'disabled'}>${value}</button>`).join('')}</div></div><div class="audio-choice"><span><strong>Reverb</strong><small>Light local ambience.</small></span><div>${['off','light','medium','strong'].map((value) => `<button data-reverb="${value}" class="${audioMods.reverb === value ? 'selected-option' : ''}" ${processing ? '' : 'disabled'}>${value}</button>`).join('')}</div></div><p class="sheet-section">5-BAND EQ</p><div class="audio-eq">${eq.map(([label, key]) => `<label><span>${label}<output id="eq${key}Value">${audioMods.eq[key] > 0 ? '+' : ''}${audioMods.eq[key]}</output></span><input data-eq="${key}" type="range" min="-12" max="12" value="${audioMods.eq[key]}" ${processing ? '' : 'disabled'}></label>`).join('')}</div><button id="resetEq" class="sheet-option" ${processing ? '' : 'disabled'}>Reset EQ</button><p class="sheet-section">YOUR PRESETS</p><button id="saveCustomAudioPreset" class="sheet-option">＋ Save current Audio preset</button>${customAudioPresets.length ? `<div class="custom-audio-presets">${customAudioPresets.map((preset) => `<span><button data-custom-audio="${preset.id}">${escapeHTML(preset.name)}</button><button data-delete-custom-audio="${preset.id}" aria-label="Delete ${escapeHTML(preset.name)}">×</button></span>`).join('')}</div>` : '<p class="sheet-note">Save a setup like “My Bass” and it stays only on this device.</p>'}<label class="audio-remember"><input id="rememberAudioMods" type="checkbox" ${audioMods.remember ? 'checked' : ''}><span><strong>Remember Audio Mods</strong><small>Restores safe settings when Zombie opens again.</small></span></label><p class="audio-experimental">Pitch is intentionally unavailable for now. Independent real-time pitch shifting could weaken iPhone background playback, so Zombie keeps the stable player instead.</p>`;
+  $('#resetAudioMods').onclick = resetAudioMods; $('#resetEq').onclick = () => { audioMods.eq = { ...AUDIO_MOD_DEFAULTS.eq }; applyAudioMods({ userGesture: true }); saveAudioMods(); openAudioMods(); toast('EQ reset'); };
+  $('#bassControl')?.addEventListener('input', (event) => { $('#bassValue').textContent = `${event.target.value}%`; updateAudioModRange('bass', event.target.value); });
+  $('#trebleControl')?.addEventListener('input', (event) => { $('#trebleValue').textContent = String(event.target.value); updateAudioModRange('treble', event.target.value); });
+  $('#sheetContent').querySelectorAll('[data-eq]').forEach((input) => input.addEventListener('input', (event) => { const key = event.target.dataset.eq; const value = Number(event.target.value); $(`#eq${key}Value`).textContent = `${value > 0 ? '+' : ''}${value}`; updateAudioEq(key, value); }));
+  $('#sheetContent').querySelectorAll('[data-audio-speed]').forEach((button) => { button.onclick = () => { audioMods.speed = Number(button.dataset.audioSpeed); applyAudioMods({ userGesture: true }); saveAudioMods(); toast(audioMods.speed === 1 ? 'Original speed restored' : `Playback speed: ${audioMods.speed}×`); openAudioMods(); }; });
+  $('#sheetContent').querySelectorAll('[data-vocal]').forEach((button) => { button.onclick = () => { audioMods.vocal = button.dataset.vocal; applyAudioMods({ userGesture: true }); saveAudioMods(); openAudioMods(); }; });
+  $('#sheetContent').querySelectorAll('[data-reverb]').forEach((button) => { button.onclick = () => { audioMods.reverb = button.dataset.reverb; applyAudioMods({ userGesture: true }); saveAudioMods(); openAudioMods(); }; });
+  $('#sheetContent').querySelectorAll('[data-audio-preset]').forEach((button) => { button.onclick = () => { const preset = AUDIO_PRESETS[button.dataset.audioPreset]; applyAudioPreset(button.dataset.audioPreset, preset.values, preset.label); }; });
+  $('#saveCustomAudioPreset').onclick = () => { void saveCustomAudioPreset(); }; $('#sheetContent').querySelectorAll('[data-custom-audio]').forEach((button) => { button.onclick = () => { const preset = customAudioPresets.find((entry) => entry.id === button.dataset.customAudio); if (preset) applyAudioPreset('custom', preset.values, preset.name); }; }); $('#sheetContent').querySelectorAll('[data-delete-custom-audio]').forEach((button) => { button.onclick = () => { void deleteCustomAudioPreset(button.dataset.deleteCustomAudio); }; });
+  $('#rememberAudioMods').onchange = (event) => { audioMods.remember = event.target.checked; saveAudioMods(); toast(audioMods.remember ? 'Audio Mods will be remembered' : 'Audio Mods will reset next time'); };
   showSheet();
 }
 async function mediaArtworkFor(track) {
@@ -569,6 +686,7 @@ function replayVisualClass(element, className) {
 function animatePlaybackControls(state) {
   ['#playButton', '#miniPlay'].forEach((selector) => replayVisualClass($(selector), state === 'playing' ? 'playback-started' : 'playback-paused'));
 }
+function animateSkip(direction) { replayVisualClass($('#nowPlayingScreen'), direction === 'next' ? 'skip-forward' : 'skip-backward'); replayVisualClass($('#miniPlayer'), direction === 'next' ? 'skip-forward' : 'skip-backward'); }
 function playbackDebug(stage, details = {}) {
   console.info(`[Zombie playback] ${stage}`, {
     previous: details.previous || null, next: details.next || null, queueIndex, queueLength: queue.length, shuffleOn, repeatMode,
@@ -1046,13 +1164,14 @@ function togglePlayback() {
 function openSleepTimer() {
   $('#sheetTitle').textContent = 'Sleep timer';
   const remaining = sleepTimerEndsAt ? Math.max(0, Math.ceil((sleepTimerEndsAt - Date.now()) / 60000)) : 0;
-  $('#sheetContent').innerHTML = `<p class="sheet-note">Zombie will pause the current player when the timer finishes. Keep in mind iPhone may delay browser timers while an app is suspended.</p>${remaining ? `<p class="sheet-section">ACTIVE · ${remaining} MIN LEFT</p>` : ''}<button class="sheet-option" data-sleep="0">Turn off timer</button>${[15, 30, 45, 60].map((minutes) => `<button class="sheet-option" data-sleep="${minutes}">${minutes} minutes</button>`).join('')}`;
-  $('#sheetContent').querySelectorAll('[data-sleep]').forEach((button) => { button.onclick = () => setSleepTimer(Number(button.dataset.sleep)); });
+  $('#sheetContent').innerHTML = `<p class="sheet-note">Zombie will pause the current player when the timer finishes. Keep in mind iPhone may delay browser timers while an app is suspended.</p>${remaining ? `<p class="sheet-section">ACTIVE · ${remaining} MIN LEFT</p>` : sleepAfterCurrent ? '<p class="sheet-section">ACTIVE · END OF CURRENT SONG</p>' : ''}<button class="sheet-option" data-sleep="0">Turn off timer</button><button class="sheet-option" data-sleep="end">End of current song</button>${[15, 30, 45, 60].map((minutes) => `<button class="sheet-option" data-sleep="${minutes}">${minutes === 60 ? '1 hour' : `${minutes} minutes`}</button>`).join('')}`;
+  $('#sheetContent').querySelectorAll('[data-sleep]').forEach((button) => { button.onclick = () => setSleepTimer(button.dataset.sleep === 'end' ? 'end' : Number(button.dataset.sleep)); });
   showSheet();
 }
 function setSleepTimer(minutes) {
-  clearTimeout(sleepTimerHandle); sleepTimerHandle = null; sleepTimerEndsAt = 0;
+  clearTimeout(sleepTimerHandle); sleepTimerHandle = null; sleepTimerEndsAt = 0; sleepAfterCurrent = false;
   if (!minutes) { closeSheet(); toast('Sleep timer off'); return; }
+  if (minutes === 'end') { sleepAfterCurrent = true; closeSheet(); toast('Sleep timer: end of this song'); return; }
   sleepTimerEndsAt = Date.now() + (minutes * 60 * 1000);
   sleepTimerHandle = window.setTimeout(() => { sleepTimerHandle = null; sleepTimerEndsAt = 0; audio.pause(); toast('Sleep timer paused Zombie'); }, minutes * 60 * 1000);
   closeSheet(); toast(`Sleep timer: ${minutes} minutes`);
@@ -1172,6 +1291,7 @@ async function advanceAfterEnded() {
   lastHandledEndedEpoch = playbackEpoch;
   endedTransitionInFlight = true;
   try {
+    if (sleepAfterCurrent) { sleepAfterCurrent = false; audio.currentTime = 0; setMediaPlaybackState('paused'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; syncAmbientMotionState(); savePlayerState(true); render(); toast('Sleep timer paused Zombie'); return; }
     playbackDebug('ended-transition-start', { previous: trackDebug(finishedTrack), finishedSource, playbackEpoch });
     await nextTrack(true);
   }
@@ -1528,7 +1648,7 @@ function closeSheet() {
 function openSongOptions(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = track.title;
-  $('#sheetContent').innerHTML = `<div class="sheet-song-header"><span class="sheet-song-art art-${artVariant(track)}" data-sheet-art="${track.id}"></span><span><strong>${track.emoji} ${escapeHTML(track.title)}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album || 'Single')}</small></span></div><p class="sheet-section">SONG</p><button class="sheet-option" data-action="favorite">${track.isFavorite ? '♥ Remove from favorites' : '♡ Add to favorites'}</button><button class="sheet-option" data-action="play-next">Play next</button><button class="sheet-option" data-action="queue">Add to queue</button><button class="sheet-option" data-action="playlist">Add or remove from playlist</button><button class="sheet-option" data-action="lyrics">≡ Lyrics</button><button class="sheet-option" data-action="exclude">${track.excludeFromRecommendations ? '✓ Include in future recommendations' : '⊘ Exclude from future recommendations'}</button><p class="sheet-section">EDIT</p><button class="sheet-option" data-action="edit">Edit song information</button><button class="sheet-option" data-action="artwork">Change artwork</button><button class="sheet-option" data-action="visual">${track.visualId ? '◇ Replace animated visual' : '◇ Add animated visual'}</button>${track.visualId ? '<button class="sheet-option" data-action="remove-visual">Remove animated visual</button>' : ''}<button class="sheet-option" data-action="details">Song details</button><p class="sheet-section">BROWSE</p><button class="sheet-option" data-action="album">Go to album</button><button class="sheet-option" data-action="artist">Go to artist</button><button class="sheet-option" data-action="share">Share local file</button><p class="sheet-section">DEVICE</p><button class="sheet-option danger-text" data-action="delete">Delete song from this iPhone</button>`;
+  $('#sheetContent').innerHTML = `<div class="sheet-song-header"><span class="sheet-song-art art-${artVariant(track)}" data-sheet-art="${track.id}"></span><span><strong>${track.emoji} ${escapeHTML(track.title)}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album || 'Single')}</small></span></div><p class="sheet-section">PLAYBACK</p><button class="sheet-option" data-action="play-next">Play next</button><button class="sheet-option" data-action="queue">Add to queue</button><p class="sheet-section">LIBRARY</p><button class="sheet-option" data-action="favorite">${track.isFavorite ? '♥ Remove from favorites' : '♡ Add to favorites'}</button><button class="sheet-option" data-action="playlist">Add or remove from playlist</button><button class="sheet-option" data-action="lyrics">≡ Lyrics</button><button class="sheet-option" data-action="exclude">${track.excludeFromRecommendations ? '✓ Include in future recommendations' : '⊘ Exclude from future recommendations'}</button><p class="sheet-section">EDIT</p><button class="sheet-option" data-action="edit">Edit song information and note</button><button class="sheet-option" data-action="artwork">Change artwork</button><button class="sheet-option" data-action="visual">${track.visualId ? '◇ Replace animated visual' : '◇ Add animated visual'}</button>${track.visualId ? '<button class="sheet-option" data-action="remove-visual">Remove animated visual</button>' : ''}<p class="sheet-section">MORE</p><button class="sheet-option" data-action="details">Song information</button><button class="sheet-option" data-action="album">Go to album</button><button class="sheet-option" data-action="artist">Go to artist</button><button class="sheet-option" data-action="share">Share local file</button><p class="sheet-section">DEVICE</p><button class="sheet-option danger-text" data-action="delete">Delete song from this iPhone</button>`;
   applyArtwork($('#sheetContent [data-sheet-art]'), track);
   $('#sheetContent').querySelector('[data-action="favorite"]').onclick = async () => { await toggleFavorite(id); closeSheet(); };
   $('#sheetContent').querySelector('[data-action="play-next"]').onclick = () => { addToQueue(id, true); closeSheet(); };
@@ -1636,11 +1756,14 @@ function wireUI() {
   $('#layoutButton').onclick = () => cyclePreference('layout', ['comfortable', 'compact', 'grid']);
   $('#appearanceButton').onclick = () => cyclePreference('appearance', ['soft', 'pure', 'ambient']);
   $('#visualPreferenceButton').onclick = () => { cyclePreference('visualMode', ['artwork', 'animation']); void syncNowPlayingVisual(); };
+  $('#dynamicColoursButton').onclick = () => cyclePreference('dynamicColours', ['balanced', 'full', 'minimal', 'off']);
+  $('#colourIntensityButton').onclick = () => cyclePreference('colourIntensity', ['low', 'medium', 'high']);
+  $('#visualEffectsButton').onclick = () => { preferences.visualEffects = !preferences.visualEffects; savePreferences(); };
   $('#exportBackupButton').onclick = () => exportBackup(false); $('#exportFullBackupButton').onclick = () => exportBackup(true); $('#restoreBackupButton').onclick = () => $('#backupInput').click();
   $('[data-action="back-to-library"]').onclick = () => { currentView = 'songs'; render(); };
   $('#openNowPlaying').onclick = openNowPlaying; $('#closeNowPlaying').onclick = closeNowPlaying;
-  $('#miniPlay').onclick = togglePlayback; $('#miniNext').onclick = () => nextTrack(); $('#miniPrevious').onclick = previousTrack;
-  $('#playButton').onclick = togglePlayback; $('#nextButton').onclick = () => nextTrack(); $('#previousButton').onclick = previousTrack;
+  $('#miniPlay').onclick = togglePlayback; $('#miniNext').onclick = () => { animateSkip('next'); void nextTrack(); }; $('#miniPrevious').onclick = () => { animateSkip('previous'); void previousTrack(); };
+  $('#playButton').onclick = togglePlayback; $('#nextButton').onclick = () => { animateSkip('next'); void nextTrack(); }; $('#previousButton').onclick = () => { animateSkip('previous'); void previousTrack(); };
   $('#shuffleButton').onclick = () => setShuffleEnabled(!shuffleOn);
   $('#repeatButton').onclick = () => { repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off'; updatePlayerMode(); toast(`Repeat ${repeatMode}`); };
   $('#npSeek').oninput = (event) => { const percent = Number(event.target.value) || 0; event.target.style.setProperty('--seek-progress', `${percent}%`); setWaveformProgress(percent); if (audio.duration) { audio.currentTime = (percent / 100) * audio.duration; $('#currentTime').textContent = formatTime(audio.currentTime); $('#remainingTime').textContent = formatRemainingTime((audio.duration || 0) - audio.currentTime); savePlayerState(true); } };
@@ -1655,7 +1778,7 @@ function wireUI() {
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
   audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); $('#remainingTime').textContent = formatRemainingTime((audio.duration || 0) - (audio.currentTime || 0)); updateMediaPosition(); updateSyncedLyrics(); savePlayerState(); };
   audio.onloadedmetadata = () => { $('#remainingTime').textContent = formatRemainingTime(audio.duration); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
-  audio.onplay = () => { playbackEpoch += 1; syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
+  audio.onplay = () => { if (audioGraph?.context?.state === 'suspended') void audioGraph.context.resume().catch(() => {}); playbackEpoch += 1; syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
   audio.onpause = () => { syncAmbientMotionState(); capturePausedResumeSnapshot('audio-pause-event'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; animatePlaybackControls('paused'); setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
   audio.onended = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
   audio.onerror = () => { const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); $('#miniPlayer').classList.remove('loading'); setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); };
@@ -1698,8 +1821,8 @@ function wireUI() {
 }
 async function initialise() {
   try {
-    installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=33.1').catch(() => {});
+    installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=34').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
