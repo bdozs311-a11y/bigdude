@@ -8,6 +8,7 @@ let db;
 let tracks = [], playlists = [];
 let currentId = null, currentUrl = null, loadToken = 0, playbackSerial = 0, countedSerial = -1;
 let endedTransitionInFlight = false, pendingAudio = null, preparedNext = null, preloadToken = 0;
+let pausedResumeSnapshot = null, mediaResumeAttempt = 0;
 const retiredAudioUrls = new Set();
 let currentView = 'songs', collectionFilter = null, activePlaylistId = null;
 let queue = [], queueIndex = -1, shuffleOn = false, shuffleBag = [], shuffleHistory = [];
@@ -202,6 +203,33 @@ function updateMediaPosition() {
 }
 function trackDebug(track) { return track ? { id: track.id, title: track.title } : null; }
 function audioErrorDebug() { const error = audio.error; return error ? { code: error.code, message: error.message || 'MediaError' } : null; }
+function currentAudioSource() { return audio.currentSrc || audio.src || ''; }
+function capturePausedResumeSnapshot(reason = 'pause') {
+  const track = tracks.find((entry) => entry.id === (pendingAudio?.id || currentId));
+  if (!track || audio.ended) return;
+  pausedResumeSnapshot = {
+    id: track.id,
+    src: currentAudioSource(),
+    position: Number.isFinite(audio.currentTime) ? audio.currentTime : 0,
+    token: loadToken,
+    capturedAt: Date.now(),
+  };
+  playbackDebug('pause-source-snapshotted', { reason, next: trackDebug(track), pausedSourceAlive: Boolean(pausedResumeSnapshot.src) });
+}
+function hasLivePausedSource(track) {
+  const source = currentAudioSource();
+  const snapshotMatches = !pausedResumeSnapshot || pausedResumeSnapshot.id !== track?.id || !pausedResumeSnapshot.src || pausedResumeSnapshot.src === source;
+  return Boolean(source && snapshotMatches && !audio.error);
+}
+function replayVisualClass(element, className) {
+  if (!element) return;
+  element.classList.remove(className);
+  void element.offsetWidth;
+  element.classList.add(className);
+}
+function animatePlaybackControls(state) {
+  ['#playButton', '#miniPlay'].forEach((selector) => replayVisualClass($(selector), state === 'playing' ? 'playback-started' : 'playback-paused'));
+}
 function playbackDebug(stage, details = {}) {
   console.info(`[Zombie playback] ${stage}`, {
     previous: details.previous || null, next: details.next || null, queueIndex, queueLength: queue.length, shuffleOn, repeatMode,
@@ -250,7 +278,8 @@ function confirmActualPlayback(track, token, reason) {
   }
   commitPendingPlayback('play-confirmed');
   const activeTrack = tracks.find((entry) => entry.id === currentId) || track;
-  $('#miniPlayer').classList.remove('loading'); $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; setMediaPlaybackState('playing');
+  pausedResumeSnapshot = null;
+  $('#miniPlayer').classList.remove('loading'); $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; animatePlaybackControls('playing'); setMediaPlaybackState('playing');
   if (activeTrack && countedSerial !== playbackSerial) { countedSerial = playbackSerial; activeTrack.playCount = (activeTrack.playCount || 0) + 1; activeTrack.lastPlayed = Date.now(); saveRecord('tracks', activeTrack).catch(() => {}); }
   releaseRetiredAudioUrls('replacement confirmed');
   playbackDebug('play-confirmed', { reason, next: trackDebug(activeTrack) }); void updateMediaSession(activeTrack); render(); void prepareNextTrack();
@@ -271,12 +300,51 @@ async function requestAudioPlay(track, token = loadToken, reason = 'play') {
     throw error;
   }
 }
+async function rebuildPausedSource(track, reason = 'resume-source-recovery') {
+  const savedPosition = Number.isFinite(audio.currentTime) && audio.currentTime > 0 ? audio.currentTime : (pausedResumeSnapshot?.id === track.id ? pausedResumeSnapshot.position : restoredPosition);
+  const token = ++loadToken;
+  const oldUrl = pendingAudio?.url || currentUrl || pausedResumeSnapshot?.src || '';
+  playbackDebug('resume-source-recovery-start', { reason, next: trackDebug(track), previous: trackDebug(tracks.find((entry) => entry.id === currentId)), savedPosition });
+  try {
+    const blob = await getAudioBlob(track.id);
+    if (token !== loadToken) return false;
+    if (!blob) { playbackDebug('resume-source-recovery-blob-missing', { reason, next: trackDebug(track), blobLoaded: false }); return false; }
+    const url = URL.createObjectURL(blob);
+    pendingAudio = { id: track.id, url, token, oldUrl, previous: trackDebug(tracks.find((entry) => entry.id === currentId)) };
+    audio.src = url;
+    if (savedPosition > 0) audio.addEventListener('loadedmetadata', () => { audio.currentTime = Math.min(savedPosition, Math.max(0, (audio.duration || savedPosition) - 0.05)); }, { once: true });
+    playbackDebug('resume-source-recovery-attached', { reason, next: trackDebug(track), blobLoaded: true, objectUrlCreated: true, savedPosition });
+    const started = await requestAudioPlay(track, token, reason);
+    return started && confirmActualPlayback(track, token, reason);
+  } catch (error) {
+    playbackDebug('resume-source-recovery-failed', { reason, next: trackDebug(track), recoveryError: { name: error?.name || 'Error', message: error?.message || String(error) } });
+    setMediaPlaybackState('paused');
+    return false;
+  }
+}
 async function resumeCurrentAudio(reason = 'resume') {
   const track = tracks.find((entry) => entry.id === (pendingAudio?.id || currentId));
-  playbackDebug('resume-requested', { reason, next: trackDebug(track), sourceAlive: Boolean(audio.src || audio.currentSrc) });
-  if (!track || !audio.src) { playbackDebug('resume-skipped-no-live-source', { reason, next: trackDebug(track) }); return false; }
-  try { const started = await requestAudioPlay(track, loadToken, reason); return started && confirmActualPlayback(track, loadToken, reason); }
-  catch (error) { playbackDebug('resume-failed', { reason, next: trackDebug(track), resumeError: { name: error?.name || 'Error', message: error?.message || String(error) } }); toast('Zombie could not resume this song'); return false; }
+  const attempt = ++mediaResumeAttempt;
+  playbackDebug('resume-requested', { reason, next: trackDebug(track), sourceAlive: hasLivePausedSource(track), pausedSnapshot: pausedResumeSnapshot?.id === track?.id ? { position: pausedResumeSnapshot.position, sameSource: pausedResumeSnapshot.src === currentAudioSource() } : null, mediaResumeAttempt: attempt });
+  if (!track) { playbackDebug('resume-skipped-no-track', { reason, mediaResumeAttempt: attempt }); return false; }
+  if (!hasLivePausedSource(track)) {
+    const recovered = await rebuildPausedSource(track, `${reason}-missing-source`);
+    if (!recovered) toast('Zombie could not restore this paused song');
+    return recovered;
+  }
+  try {
+    // This is deliberately the direct fast path for the iPhone Lock Screen action: no UI/render work occurs before play().
+    const started = await requestAudioPlay(track, loadToken, reason);
+    const confirmed = started && confirmActualPlayback(track, loadToken, reason);
+    if (confirmed) pausedResumeSnapshot = null;
+    return confirmed;
+  } catch (error) {
+    const recoverableSourceFailure = Boolean(audio.error) || !currentAudioSource();
+    playbackDebug('resume-failed', { reason, next: trackDebug(track), mediaResumeAttempt: attempt, recoverableSourceFailure, resumeError: { name: error?.name || 'Error', message: error?.message || String(error) } });
+    if (recoverableSourceFailure) return rebuildPausedSource(track, `${reason}-failed-source`);
+    toast('Zombie could not resume this song');
+    return false;
+  }
 }
 async function updateMediaSession(track = tracks.find((entry) => entry.id === currentId)) {
   if (!track || !('mediaSession' in navigator) || !window.MediaMetadata) return;
@@ -291,7 +359,11 @@ async function updateMediaSession(track = tracks.find((entry) => entry.id === cu
 function configureMediaSession() {
   if (!('mediaSession' in navigator)) return;
   const actions = {
-    play: () => { playbackDebug('media-session-play-handler', { next: trackDebug(tracks.find((entry) => entry.id === currentId)) }); void resumeCurrentAudio('media-session-play'); }, pause: () => { playbackDebug('media-session-pause-handler'); audio.pause(); },
+    play: () => {
+      const track = tracks.find((entry) => entry.id === (pendingAudio?.id || currentId));
+      playbackDebug('media-session-play-handler-fired', { next: trackDebug(track), sourceAlive: hasLivePausedSource(track), pausedSnapshot: pausedResumeSnapshot?.id === track?.id ? { position: pausedResumeSnapshot.position, sameSource: pausedResumeSnapshot.src === currentAudioSource() } : null });
+      void resumeCurrentAudio('media-session-play');
+    }, pause: () => { playbackDebug('media-session-pause-handler-fired'); audio.pause(); },
     previoustrack: () => { void previousTrack().catch((error) => playbackDebug('media-previous-failed', { actionError: error?.message || String(error) })); },
     nexttrack: () => { void nextTrack().catch((error) => playbackDebug('media-next-failed', { actionError: error?.message || String(error) })); },
   };
@@ -495,7 +567,10 @@ async function playTrack(id, sourceIds = null, options = {}) {
 function showMiniPlayer(track) { $('#miniPlayer').classList.remove('hidden'); syncNowPlaying(track); }
 function syncNowPlaying(track = tracks.find((entry) => entry.id === currentId)) {
   if (!track) return;
-  ['#miniPlayer', '#nowPlayingScreen'].forEach((selector) => { const panel = $(selector); panel.classList.remove('song-changing'); requestAnimationFrame(() => panel.classList.add('song-changing')); });
+  ['#miniPlayer', '#nowPlayingScreen'].forEach((selector) => {
+    const panel = $(selector); panel.classList.remove('song-changing', 'artwork-changing');
+    requestAnimationFrame(() => { panel.classList.add('song-changing', 'artwork-changing'); });
+  });
   $('#nowTitle').textContent = track.title; $('#nowArtist').textContent = track.artist;
   applyArtwork($('#miniArt'), track); applyArtwork($('#npArt'), track); applyArtwork($('#npBackdrop'), track);
   $('#npEmoji').textContent = track.emoji; $('#npTitle').textContent = track.title; $('#npArtist').textContent = track.artist; $('#npAlbum').textContent = track.album || 'Single';
@@ -718,7 +793,7 @@ async function importFiles(fileList) {
 
 async function toggleFavorite(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
-  track.isFavorite = !track.isFavorite; await saveRecord('tracks', track); syncNowPlaying(); render();
+  track.isFavorite = !track.isFavorite; await saveRecord('tracks', track); replayVisualClass($('#npFavorite'), 'favorite-pop'); syncNowPlaying(); render();
 }
 async function deleteTrack(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
@@ -884,7 +959,7 @@ function wireUI() {
   audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#currentTime').textContent = formatTime(audio.currentTime); $('#remainingTime').textContent = formatRemainingTime((audio.duration || 0) - (audio.currentTime || 0)); updateMediaPosition(); savePlayerState(); };
   audio.onloadedmetadata = () => { $('#remainingTime').textContent = formatRemainingTime(audio.duration); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
   audio.onplay = () => { const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); };
-  audio.onpause = () => { $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
+  audio.onpause = () => { capturePausedResumeSnapshot('audio-pause-event'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; animatePlaybackControls('paused'); setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
   audio.onended = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
   audio.onerror = () => { const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); $('#miniPlayer').classList.remove('loading'); setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); };
   ['waiting', 'stalled', 'suspend', 'emptied', 'abort', 'canplay'].forEach((eventName) => audio.addEventListener(eventName, () => playbackDebug(`audio-${eventName}`)));
@@ -893,20 +968,49 @@ function wireUI() {
   $('#miniPlayer').addEventListener('touchmove', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; if (!miniTouch.direction && Math.max(Math.abs(dx), Math.abs(dy)) > 8) miniTouch.direction = Math.abs(dx) > Math.abs(dy) * 1.25 ? 'horizontal' : 'vertical'; if (miniTouch.direction === 'horizontal') { const offset = Math.max(-30, Math.min(30, dx * 0.22)); $('#miniPlayer').style.transform = `translateX(${offset}px)`; $('#miniPlayer').classList.add('swiping'); } }, { passive: true });
   $('#miniPlayer').addEventListener('touchend', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; $('#miniPlayer').style.transform = ''; $('#miniPlayer').classList.remove('swiping'); if (miniTouch.direction === 'horizontal' && Math.abs(dx) > 68) { dx < 0 ? nextTrack() : previousTrack(); } else if (miniTouch.direction !== 'horizontal' && dy < -40 && Math.abs(dy) > Math.abs(dx)) openNowPlaying(); miniTouch = null; }, { passive: true });
   $('#nowPlayingScreen').addEventListener('touchstart', (event) => { fullTouchY = event.target.closest('button,input') ? null : event.changedTouches[0]?.clientY ?? null; }, { passive: true });
-  $('#nowPlayingScreen').addEventListener('touchend', (event) => { const endY = event.changedTouches[0]?.clientY; if (fullTouchY !== null && endY - fullTouchY > 70) closeNowPlaying(); fullTouchY = null; }, { passive: true });
+  $('#nowPlayingScreen').addEventListener('touchmove', (event) => {
+    const touch = event.changedTouches[0]; if (fullTouchY === null || !touch) return;
+    const distance = Math.max(0, Math.min(150, touch.clientY - fullTouchY));
+    if (distance) { const screen = $('#nowPlayingScreen'); screen.style.setProperty('--dismiss-distance', `${distance}px`); screen.classList.add('dragging'); }
+  }, { passive: true });
+  $('#nowPlayingScreen').addEventListener('touchend', (event) => {
+    const endY = event.changedTouches[0]?.clientY; const distance = fullTouchY !== null && Number.isFinite(endY) ? endY - fullTouchY : 0;
+    const screen = $('#nowPlayingScreen'); screen.style.removeProperty('--dismiss-distance'); screen.classList.remove('dragging');
+    if (fullTouchY !== null && distance > 70) closeNowPlaying(); fullTouchY = null;
+  }, { passive: true });
   const sheetCard = $('#sheet .sheet-card');
   sheetCard.addEventListener('touchstart', (event) => { sheetTouchY = $('#sheetContent').scrollTop <= 0 && !event.target.closest('button,input') ? event.changedTouches[0]?.clientY ?? null : null; }, { passive: true });
-  sheetCard.addEventListener('touchend', (event) => { const endY = event.changedTouches[0]?.clientY; if (sheetTouchY !== null && endY - sheetTouchY > 76) closeSheet(); sheetTouchY = null; }, { passive: true });
+  sheetCard.addEventListener('touchmove', (event) => {
+    const touch = event.changedTouches[0]; if (sheetTouchY === null || !touch) return;
+    const distance = Math.max(0, Math.min(145, touch.clientY - sheetTouchY));
+    if (distance) { sheetCard.style.transform = `translateY(${distance}px)`; sheetCard.classList.add('dragging'); }
+  }, { passive: true });
+  sheetCard.addEventListener('touchend', (event) => {
+    const endY = event.changedTouches[0]?.clientY; const distance = sheetTouchY !== null && Number.isFinite(endY) ? endY - sheetTouchY : 0;
+    sheetCard.style.removeProperty('transform'); sheetCard.classList.remove('dragging');
+    if (sheetTouchY !== null && distance > 76) closeSheet(); sheetTouchY = null;
+  }, { passive: true });
 }
 async function initialise() {
   try {
     await openDatabase(); await loadLibrary(); await restorePlayerState(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=18').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=19').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
   }
 }
 initialise();
-window.addEventListener('pagehide', () => { savePlayerState(true); artworkUrls.forEach((url) => URL.revokeObjectURL(url)); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') savePlayerState(true); });
+window.addEventListener('pagehide', (event) => {
+  if (audio.paused) capturePausedResumeSnapshot('pagehide');
+  playbackDebug('pagehide', { persisted: Boolean(event.persisted), pausedSourceAlive: hasLivePausedSource(tracks.find((entry) => entry.id === currentId)) });
+  savePlayerState(true); artworkUrls.forEach((url) => URL.revokeObjectURL(url));
+});
+window.addEventListener('pageshow', (event) => playbackDebug('pageshow', { persisted: Boolean(event.persisted), pausedSourceAlive: hasLivePausedSource(tracks.find((entry) => entry.id === currentId)) }));
+document.addEventListener('visibilitychange', () => {
+  const track = tracks.find((entry) => entry.id === (pendingAudio?.id || currentId));
+  if (document.visibilityState === 'hidden') { if (audio.paused) capturePausedResumeSnapshot('visibility-hidden'); savePlayerState(true); }
+  playbackDebug(`visibility-${document.visibilityState}`, { next: trackDebug(track), pausedSourceAlive: hasLivePausedSource(track) });
+});
+document.addEventListener('freeze', () => playbackDebug('document-freeze', { pausedSourceAlive: hasLivePausedSource(tracks.find((entry) => entry.id === currentId)) }));
+document.addEventListener('resume', () => playbackDebug('document-resume', { pausedSourceAlive: hasLivePausedSource(tracks.find((entry) => entry.id === currentId)) }));
