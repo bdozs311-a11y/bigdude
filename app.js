@@ -217,10 +217,10 @@ function canUseAnimatedVisual(track = tracks.find((entry) => entry.id === curren
 }
 function stopNowPlayingVisual() {
   const visual = $('#npVisual'); if (!visual) return;
-  visual.pause(); visual.classList.remove('active'); visual.classList.add('hidden'); visual.removeAttribute('src');
+  visual.pause(); visual.classList.remove('active'); visual.classList.add('hidden'); visual.removeAttribute('src'); $('#npArtStage')?.classList.remove('visual-active');
 }
 async function syncNowPlayingVisual(track = tracks.find((entry) => entry.id === currentId)) {
-  const visual = $('#npVisual'); if (!visual) return;
+  const visual = $('#npVisual'), stage = $('#npArtStage'); if (!visual) return;
   const token = ++visualLoadToken;
   if (!canUseAnimatedVisual(track)) { stopNowPlayingVisual(); return; }
   try {
@@ -228,7 +228,7 @@ async function syncNowPlayingVisual(track = tracks.find((entry) => entry.id === 
     if (token !== visualLoadToken || !canUseAnimatedVisual(track) || !record?.blob) return;
     let url = visualUrls.get(track.visualId);
     if (!url) { url = URL.createObjectURL(record.blob); visualUrls.set(track.visualId, url); }
-    visual.src = url; visual.classList.remove('hidden'); requestAnimationFrame(() => visual.classList.add('active'));
+    visual.src = url; stage?.classList.remove('visual-active'); visual.classList.remove('hidden'); requestAnimationFrame(() => { visual.classList.add('active'); stage?.classList.add('visual-active'); });
     await visual.play();
   } catch (error) {
     if (token === visualLoadToken) { stopNowPlayingVisual(); console.info('[Zombie visual] local visual could not play', { name: error?.name || 'Error', message: error?.message || String(error) }); }
@@ -292,13 +292,19 @@ function updateSyncedLyrics(force = false) {
   lastLyricsIndex = activeIndex;
   const lines = [...$('#lyricsContent').querySelectorAll('[data-lyric-index]')];
   lines.forEach((line, index) => { line.classList.toggle('lyric-active', index === activeIndex); line.classList.toggle('lyric-past', index < activeIndex); line.classList.toggle('lyric-future', index > activeIndex); });
-  const activeLine = lines[activeIndex]; if (activeLine) activeLine.scrollIntoView({ block: 'center', behavior: force || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  const activeLine = lines[activeIndex]; const content = $('#lyricsContent');
+  if (activeLine && content) {
+    const lineBox = activeLine.getBoundingClientRect(), contentBox = content.getBoundingClientRect();
+    const target = Math.max(0, content.scrollTop + lineBox.top - contentBox.top - (content.clientHeight * .42));
+    const needsScroll = force || Math.abs(content.scrollTop - target) > Math.max(42, content.clientHeight * .18);
+    if (needsScroll) content.scrollTo({ top: target, behavior: force || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  }
 }
 function openLyrics(id = currentId) {
   const track = tracks.find((entry) => entry.id === id); if (!track) { toast('Choose a song first'); return; }
-  activeLyricsId = id; lastLyricsIndex = -1; const screen = $('#lyricsScreen'); screen.classList.remove('hidden'); requestAnimationFrame(() => screen.classList.add('presented')); renderLyrics(track);
+  activeLyricsId = id; lastLyricsIndex = -1; const screen = $('#lyricsScreen'); screen.classList.remove('hidden'); $('#lyricsButton').classList.add('active'); syncModalScrollLock(); requestAnimationFrame(() => screen.classList.add('presented')); renderLyrics(track);
 }
-function closeLyrics() { const screen = $('#lyricsScreen'); screen.classList.remove('presented'); setTimeout(() => screen.classList.add('hidden'), 180); activeLyricsId = null; lastLyricsIndex = -1; }
+function closeLyrics() { const screen = $('#lyricsScreen'); screen.classList.remove('presented'); $('#lyricsButton').classList.remove('active'); setTimeout(() => { screen.classList.add('hidden'); syncModalScrollLock(); }, 180); activeLyricsId = null; lastLyricsIndex = -1; }
 function openLyricsEditor(id = currentId) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = 'Offline lyrics';
@@ -320,6 +326,7 @@ async function importLyricsFile(file) {
   } catch (error) { toast(error.message || 'Zombie could not read those lyrics'); }
 }
 function openAudioMods() {
+  $('#audioModsButton').classList.add('active');
   $('#sheetTitle').textContent = 'Audio';
   $('#sheetContent').innerHTML = `<p class="sheet-note">Speed changes playback only — your files are never changed. Live EQ, reverb, and pitch processing stay off because Web Audio can make iPhone background playback less reliable.</p><p class="sheet-section">PLAYBACK SPEED</p>${[0.8, 1, 1.2, 1.5].map((rate) => `<button class="sheet-option ${preferences.playbackRate === rate ? 'selected-option' : ''}" data-rate="${rate}">${rate === 1 ? 'Normal · 1×' : `${rate}×`}</button>`).join('')}`;
   $('#sheetContent').querySelectorAll('[data-rate]').forEach((button) => { button.onclick = () => { preferences.playbackRate = Number(button.dataset.rate); audio.playbackRate = preferences.playbackRate; savePreferences(); updateMediaPosition(); closeSheet(); toast(preferences.playbackRate === 1 ? 'Original sound restored' : `Playback speed: ${preferences.playbackRate}×`); }; });
@@ -818,15 +825,17 @@ function updatePlayerMode() {
 function openNowPlaying() {
   if (!currentId) return;
   clearTimeout(panelTimer); const screen = $('#nowPlayingScreen'); screen.classList.remove('hidden', 'closing');
+  syncModalScrollLock();
   requestAnimationFrame(() => { screen.classList.add('presented'); void syncNowPlayingVisual(); });
 }
 function closeNowPlaying() {
   const screen = $('#nowPlayingScreen'); if (screen.classList.contains('hidden')) return;
   stopNowPlayingVisual();
   screen.classList.remove('presented'); screen.classList.add('closing'); clearTimeout(panelTimer);
-  panelTimer = setTimeout(() => { screen.classList.add('hidden'); screen.classList.remove('closing'); }, 210);
+  panelTimer = setTimeout(() => { screen.classList.add('hidden'); screen.classList.remove('closing'); syncModalScrollLock(); }, 210);
 }
-function showSheet() { clearTimeout(window.zombieSheetTimer); $('#sheetContent').scrollTop = 0; const sheet = $('#sheet'); sheet.classList.remove('hidden', 'closing'); requestAnimationFrame(() => sheet.classList.add('shown')); }
+function syncModalScrollLock() { document.body.classList.toggle('zombie-modal-open', ['#nowPlayingScreen', '#lyricsScreen', '#sheet'].some((selector) => !$(selector).classList.contains('hidden'))); }
+function showSheet() { clearTimeout(window.zombieSheetTimer); $('#sheetContent').scrollTop = 0; const sheet = $('#sheet'); sheet.classList.remove('hidden', 'closing'); syncModalScrollLock(); requestAnimationFrame(() => sheet.classList.add('shown')); }
 function queueTrackMarkup(track, position, kind = 'upcoming') {
   const canMoveUp = position > 0;
   const state = kind === 'current' ? (audio.paused ? 'Ⅱ' : '▶') : String(position + 1).padStart(2, '0');
@@ -843,7 +852,7 @@ function saveQueueSession() { savePlayerState(true); updatePlayerMode(); void pr
 function openQueue() {
   const currentTrack = currentQueueTrack();
   const upcoming = upcomingQueueIds().map((id) => tracks.find((track) => track.id === id)).filter(Boolean);
-  $('#sheetTitle').textContent = 'Queue';
+  $('#queueButton').classList.add('active'); $('#sheetTitle').textContent = 'Queue';
   $('#sheetContent').innerHTML = currentTrack ? `<div class="queue-summary"><span>${shuffleOn ? 'SHUFFLED ORDER' : 'PLAYBACK QUEUE'}</span><button id="clearUpcoming" ${upcoming.length ? '' : 'disabled'}>Clear upcoming</button></div><p class="sheet-section">NOW PLAYING</p>${queueTrackMarkup(currentTrack, 0, 'current')}${upcoming.length ? `<p class="sheet-section">UP NEXT</p>${queueTrackMarkup(upcoming[0], 0)}${upcoming.slice(1).length ? `<p class="sheet-section">REMAINING</p>${upcoming.slice(1).map((track, index) => queueTrackMarkup(track, index + 1)).join('')}` : ''}` : '<p class="sheet-note">No more songs are queued after this one.</p>'}` : '<p class="sheet-note">Choose a song to start a queue.</p>';
   queueArtworkInSheet();
   $('#clearUpcoming')?.addEventListener('click', clearUpcomingQueue);
@@ -1032,8 +1041,8 @@ async function removeFromPlaylist(playlistId, trackId) { const playlist = playli
 async function reorderPlaylist(playlistId, from, to) { const playlist = playlists.find((entry) => entry.id === playlistId); if (!playlist || to < 0 || to >= playlist.trackIds.length) return; [playlist.trackIds[from], playlist.trackIds[to]] = [playlist.trackIds[to], playlist.trackIds[from]]; await savePlaylist(playlist); render(); }
 function closeSheet() {
   const sheet = $('#sheet'); if (sheet.classList.contains('hidden')) return;
-  sheet.classList.remove('shown'); sheet.classList.add('closing'); clearTimeout(window.zombieSheetTimer);
-  window.zombieSheetTimer = setTimeout(() => { sheet.classList.add('hidden'); sheet.classList.remove('closing'); }, 180);
+  sheet.classList.remove('shown'); sheet.classList.add('closing'); $('.player-tools .queue-button.active:not(#visualButton)')?.classList.remove('active'); clearTimeout(window.zombieSheetTimer);
+  window.zombieSheetTimer = setTimeout(() => { sheet.classList.add('hidden'); sheet.classList.remove('closing'); syncModalScrollLock(); }, 180);
 }
 
 function openSongOptions(id) {
@@ -1202,7 +1211,7 @@ function wireUI() {
 async function initialise() {
   try {
     await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; } render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=21').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=22').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
