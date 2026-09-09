@@ -9,6 +9,7 @@ let tracks = [], playlists = [];
 let currentId = null, currentUrl = null, loadToken = 0, playbackSerial = 0, countedSerial = -1;
 let endedTransitionInFlight = false, pendingAudio = null, preparedNext = null, preloadToken = 0;
 let pausedResumeSnapshot = null, mediaResumeAttempt = 0;
+let playbackEpoch = 0, lastHandledEndedEpoch = -1, foregroundRecoveryToken = 0;
 const retiredAudioUrls = new Set();
 let currentView = 'songs', collectionFilter = null, activePlaylistId = null;
 let queue = [], queueIndex = -1, shuffleOn = false, shuffleBag = [], shuffleHistory = [];
@@ -25,6 +26,10 @@ const FULL_BACKUP_LIMIT = 40 * 1024 * 1024;
 const preferences = { layout: 'comfortable', appearance: 'soft', visualMode: 'artwork', playbackRate: 1 };
 
 const randomEmoji = () => EMOJIS[Math.floor(Math.random() * EMOJIS.length)];
+const neutralArtist = (value) => {
+  const artist = String(value || '').trim();
+  return artist && !/^unknown artist$/i.test(artist) ? artist : 'Local audio';
+};
 const formatTime = (seconds) => !Number.isFinite(seconds) ? '0:00' : `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
 const formatRemainingTime = (seconds) => `−${formatTime(Math.max(0, seconds || 0))}`;
 const formatLrcTimestamp = (seconds) => { const total = Math.max(0, Math.round((Number(seconds) || 0) * 100)); const minutes = Math.floor(total / 6000); const remainder = total % 6000; return `[${String(minutes).padStart(2, '0')}:${String(Math.floor(remainder / 100)).padStart(2, '0')}.${String(remainder % 100).padStart(2, '0')}]`; };
@@ -109,7 +114,6 @@ function installMobileScaleGuard() {
     const scale = Number(visual?.scale);
     root.dataset.zombieViewportScale = Number.isFinite(scale) && Math.abs(scale - 1) > .015 ? 'scaled' : 'normal';
   };
-  const blockPinch = (event) => { if (event.touches?.length > 1) event.preventDefault(); };
   updateViewportMetrics();
   window.visualViewport?.addEventListener('resize', updateViewportMetrics, { passive: true });
   window.visualViewport?.addEventListener('scroll', updateViewportMetrics, { passive: true });
@@ -119,8 +123,6 @@ function installMobileScaleGuard() {
   // Single-finger scrolling, range inputs, queues, and lyric scrolling are deliberately left alone.
   document.addEventListener('gesturestart', (event) => event.preventDefault(), { passive: false });
   document.addEventListener('gesturechange', (event) => event.preventDefault(), { passive: false });
-  document.addEventListener('touchstart', blockPinch, { passive: false });
-  document.addEventListener('touchmove', blockPinch, { passive: false });
   document.addEventListener('dblclick', (event) => {
     if (!event.target.closest('input,textarea,select,[contenteditable="true"]')) event.preventDefault();
   }, { capture: true, passive: false });
@@ -582,6 +584,12 @@ function commitPendingPlayback(reason) {
 function schedulePlaybackDiagnostic(track, token, reason, startTime) {
   window.setTimeout(() => {
     if (token !== loadToken || currentId !== track.id) return;
+    // iPhone can delay timers while audio continues correctly in the background.
+    // A background timer is therefore diagnostic-only: it must never stop live audio.
+    if (document.visibilityState !== 'visible') {
+      playbackDebug('playback-health-check-deferred-background', { reason, next: trackDebug(track), startTime });
+      return;
+    }
     const timeAdvanced = audio.currentTime > startTime + 0.05;
     const sourceValid = Boolean(audio.currentSrc || audio.src);
     const healthy = sourceValid && audio.readyState >= 2 && (timeAdvanced || audio.ended);
@@ -593,10 +601,12 @@ function schedulePlaybackDiagnostic(track, token, reason, startTime) {
   }, 900);
 }
 function confirmActualPlayback(track, token, reason) {
-  if (token !== loadToken || audio.paused || !(audio.currentSrc || audio.src)) {
+  if (token !== loadToken || audio.paused || !(audio.currentSrc || audio.src) || audio.readyState < 2) {
     playbackDebug('play-confirmation-failed', { reason, next: trackDebug(track) }); setMediaPlaybackState('paused'); return false;
   }
-  commitPendingPlayback('play-confirmed');
+  if (!commitPendingPlayback('play-confirmed')) {
+    playbackDebug('play-confirmation-commit-failed', { reason, next: trackDebug(track) }); setMediaPlaybackState('paused'); return false;
+  }
   const activeTrack = tracks.find((entry) => entry.id === currentId) || track;
   pausedResumeSnapshot = null;
   $('#miniPlayer').classList.remove('loading'); $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; animatePlaybackControls('playing'); setMediaPlaybackState('playing');
@@ -702,7 +712,7 @@ async function loadLibrary() {
   tracks = tracks.map((track) => ({
     ...track,
     title: track.title || track.name || 'Untitled song',
-    artist: track.artist || 'Unknown artist',
+    artist: neutralArtist(track.artist),
     album: track.album || 'Single',
     genre: track.genre || '',
     emoji: track.emoji || randomEmoji(),
@@ -918,9 +928,13 @@ async function playTrack(id, sourceIds = null, options = {}) {
   } catch (error) {
     if (token === loadToken) {
       playbackDebug('transition-failed', { previous: trackDebug(previousTrack), next: trackDebug(track), transitionError: { name: error?.name || 'Error', message: error?.message || String(error) } });
-      // The new source is still the live persistent source; commit it as paused so retrying Play uses the same Blob and position.
-      const prepared = commitPendingPlayback('play-rejected-prepared-source'); setMediaPlaybackState('paused'); toast("This audio file couldn't be played.");
-      return prepared;
+      // Keep the prepared Blob source available for a later manual retry, but never report a rejected start as playback success.
+      const prepared = commitPendingPlayback('play-rejected-prepared-source');
+      if (prepared) {
+        $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; syncAmbientMotionState(); render();
+      }
+      setMediaPlaybackState('paused'); toast("This audio file couldn't be played.");
+      return false;
     }
     return false;
   } finally {
@@ -996,30 +1010,84 @@ async function nextTrack(fromEnd = false) {
   const previousQueueState = { queueIndex, shuffleBag: [...shuffleBag], shuffleHistory: [...shuffleHistory] };
   let id;
   if (shuffleOn) {
-    if (!shuffleBag.length) refillShuffleBag();
+    if (!shuffleBag.length && repeatMode === 'all') refillShuffleBag();
+    if (!shuffleBag.length) {
+      audio.pause(); audio.currentTime = 0; setMediaPlaybackState('paused');
+      $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; syncAmbientMotionState(); savePlayerState(true); render();
+      playbackDebug('shuffle-queue-ended', { fromEnd, previous: trackDebug(previousTrack) });
+      return false;
+    }
     id = shuffleBag.shift(); if (currentId) shuffleHistory.push(currentId);
   } else {
     const nextIndex = queueIndex + 1;
     if (nextIndex < queue.length) { queueIndex = nextIndex; id = queue[queueIndex]; }
     else if (repeatMode === 'all') { queueIndex = 0; id = queue[0]; }
-    else { audio.pause(); audio.currentTime = 0; if (!fromEnd) toast('You are at the end of this queue'); return; }
+    else {
+      audio.pause(); audio.currentTime = 0; setMediaPlaybackState('paused');
+      $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; syncAmbientMotionState(); savePlayerState(true); render();
+      if (!fromEnd) toast('You are at the end of this queue');
+      playbackDebug('queue-ended', { fromEnd, previous: trackDebug(previousTrack) });
+      return false;
+    }
   }
   if (!id) { playbackDebug('next-track-missing', { fromEnd, previous: trackDebug(previousTrack) }); return; }
   queueIndex = queue.indexOf(id); savePlayerState(true);
   playbackDebug('next-track-resolved', { fromEnd, previous: trackDebug(previousTrack), next: trackDebug(tracks.find((entry) => entry.id === id)) });
-  const prepared = await playTrack(id, null, { reason: fromEnd ? 'ended' : 'next' });
-  if (!prepared) {
-    queueIndex = previousQueueState.queueIndex; shuffleBag = previousQueueState.shuffleBag; shuffleHistory = previousQueueState.shuffleHistory; savePlayerState(true);
-    playbackDebug('next-track-not-prepared', { fromEnd, previous: trackDebug(previousTrack), next: trackDebug(tracks.find((entry) => entry.id === id)) });
+  const started = await playTrack(id, null, { reason: fromEnd ? 'ended' : 'next' });
+  if (!started) {
+    // A rejected next-song start may leave a valid, paused source ready for an explicit retry.
+    // Keep that source and its queue position rather than restoring a stale completed song.
+    if (currentId !== id) {
+      queueIndex = previousQueueState.queueIndex; shuffleBag = previousQueueState.shuffleBag; shuffleHistory = previousQueueState.shuffleHistory; savePlayerState(true);
+    }
+    setMediaPlaybackState('paused');
+    playbackDebug('next-track-not-started', { fromEnd, previous: trackDebug(previousTrack), next: trackDebug(tracks.find((entry) => entry.id === id)), preparedPausedSource: currentId === id });
   }
-  return prepared;
+  return started;
 }
 async function advanceAfterEnded() {
-  if (endedTransitionInFlight) { playbackDebug('ended-ignored-duplicate'); return; }
+  const finishedTrack = tracks.find((entry) => entry.id === currentId);
+  const finishedSource = currentAudioSource();
+  if (!finishedTrack || !audio.ended) { playbackDebug('ended-ignored-not-current', { previous: trackDebug(finishedTrack) }); return; }
+  if (endedTransitionInFlight || lastHandledEndedEpoch === playbackEpoch) { playbackDebug('ended-ignored-duplicate', { previous: trackDebug(finishedTrack), playbackEpoch }); return; }
+  lastHandledEndedEpoch = playbackEpoch;
   endedTransitionInFlight = true;
-  try { await nextTrack(true); }
+  try {
+    playbackDebug('ended-transition-start', { previous: trackDebug(finishedTrack), finishedSource, playbackEpoch });
+    await nextTrack(true);
+  }
   catch (error) { playbackDebug('ended-transition-failed', { transitionError: { name: error?.name || 'Error', message: error?.message || String(error) } }); toast('Zombie could not start the next song'); }
   finally { endedTransitionInFlight = false; }
+}
+function reflectPausedPlayback(reason = 'paused') {
+  setMediaPlaybackState('paused'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶';
+  syncAmbientMotionState(); savePlayerState(true); render();
+  playbackDebug('playback-reflected-paused', { reason, next: trackDebug(tracks.find((entry) => entry.id === (pendingAudio?.id || currentId))) });
+}
+function reconcilePlaybackAfterForeground() {
+  const track = tracks.find((entry) => entry.id === (pendingAudio?.id || currentId));
+  const token = ++foregroundRecoveryToken;
+  if (!track) return;
+  if (audio.ended) {
+    playbackDebug('foreground-ended-recovery', { previous: trackDebug(track) });
+    void advanceAfterEnded();
+    return;
+  }
+  const claimedPlaying = !audio.paused || navigator.mediaSession?.playbackState === 'playing';
+  if (claimedPlaying && (audio.paused || !currentAudioSource() || Boolean(audio.error))) {
+    playbackDebug('foreground-playing-state-corrected', { next: trackDebug(track), claimedPlaying });
+    reflectPausedPlayback('foreground-state-mismatch');
+    return;
+  }
+  if (audio.paused || audio.readyState < 2) return;
+  const position = audio.currentTime;
+  window.setTimeout(() => {
+    if (token !== foregroundRecoveryToken || document.visibilityState !== 'visible' || audio.paused || audio.ended || currentId !== track.id) return;
+    if (audio.currentTime <= position + .02) {
+      playbackDebug('foreground-silent-state-corrected', { next: trackDebug(track), position });
+      audio.pause(); reflectPausedPlayback('foreground-no-progress');
+    }
+  }, 1100);
 }
 async function previousTrack() {
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
@@ -1132,7 +1200,7 @@ async function metadataFor(file) {
       probe.onerror = () => { cleanup(); resolve(0); }; probe.src = url;
     });
   } catch { duration = 0; }
-  return { title: hasArtist ? titleParts.join(' - ') : name || 'Untitled song', artist: hasArtist ? possibleArtist : 'Unknown artist', album: 'Single', duration };
+  return { title: hasArtist ? titleParts.join(' - ') : name || 'Untitled song', artist: neutralArtist(hasArtist ? possibleArtist : ''), album: 'Single', duration };
 }
 async function extractMp3Artwork(file) {
   if (!/^audio\/mpeg$/i.test(file.type) && !/\.mp3$/i.test(file.name)) return null;
@@ -1312,7 +1380,7 @@ function openSongEditor(id) {
   $('#sheetContent').innerHTML = `<label class="edit-field">Title<input id="editTitle" value="${escapeHTML(track.title)}"></label><label class="edit-field">Artist<input id="editArtist" value="${escapeHTML(track.artist)}"></label><label class="edit-field">Album<input id="editAlbum" value="${escapeHTML(track.album)}"></label><label class="edit-field">Emoji<input id="editEmoji" value="${escapeHTML(track.emoji)}" maxlength="8"></label><label class="edit-field">Genre<input id="editGenre" list="genreChoices" value="${escapeHTML(track.genre || '')}" placeholder="Optional genre"></label><datalist id="genreChoices"><option>Hip-Hop</option><option>R&B</option><option>Pop</option><option>Rock</option><option>Rap</option><option>Indie</option><option>Electronic</option><option>Reggae</option><option>Soul</option><option>Other</option></datalist><button class="sheet-option" id="chooseTrackArt">Choose artwork from Photos</button>${track.artworkId ? '<button class="sheet-option" id="removeTrackArt">Remove artwork</button>' : ''}<button class="sheet-option" id="saveSongEdit">Save changes</button>`;
   $('#chooseTrackArt').onclick = () => { artTarget = { type: 'track', id }; $('#artInput').click(); };
   if ($('#removeTrackArt')) $('#removeTrackArt').onclick = async () => { await removeTrackArtwork(track); render(); syncNowPlaying(); closeSheet(); toast('Artwork removed'); };
-  $('#saveSongEdit').onclick = async () => { track.title = $('#editTitle').value.trim() || 'Untitled song'; track.artist = $('#editArtist').value.trim() || 'Unknown artist'; track.album = $('#editAlbum').value.trim() || 'Single'; track.emoji = $('#editEmoji').value.trim() || randomEmoji(); track.genre = $('#editGenre').value.trim(); await saveRecord('tracks', track); render(); syncNowPlaying(); updateMediaSession(track); closeSheet(); toast('Song details saved'); };
+  $('#saveSongEdit').onclick = async () => { track.title = $('#editTitle').value.trim() || 'Untitled song'; track.artist = neutralArtist($('#editArtist').value); track.album = $('#editAlbum').value.trim() || 'Single'; track.emoji = $('#editEmoji').value.trim() || randomEmoji(); track.genre = $('#editGenre').value.trim(); await saveRecord('tracks', track); render(); syncNowPlaying(); updateMediaSession(track); closeSheet(); toast('Song details saved'); };
   showSheet();
 }
 async function removeTrackArtwork(track) {
@@ -1393,7 +1461,7 @@ function wireUI() {
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
   audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); $('#currentTime').textContent = formatTime(audio.currentTime); $('#remainingTime').textContent = formatRemainingTime((audio.duration || 0) - (audio.currentTime || 0)); updateMediaPosition(); updateSyncedLyrics(); savePlayerState(); };
   audio.onloadedmetadata = () => { $('#remainingTime').textContent = formatRemainingTime(audio.duration); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
-  audio.onplay = () => { syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); };
+  audio.onplay = () => { playbackEpoch += 1; syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
   audio.onpause = () => { syncAmbientMotionState(); capturePausedResumeSnapshot('audio-pause-event'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; animatePlaybackControls('paused'); setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
   audio.onended = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
   audio.onerror = () => { const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); $('#miniPlayer').classList.remove('loading'); setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); };
@@ -1437,7 +1505,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=28').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=29').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
@@ -1454,7 +1522,7 @@ document.addEventListener('visibilitychange', () => {
   syncAmbientMotionState();
   const track = tracks.find((entry) => entry.id === (pendingAudio?.id || currentId));
   if (document.visibilityState === 'hidden') { if (audio.paused) capturePausedResumeSnapshot('visibility-hidden'); stopNowPlayingVisual(); savePlayerState(true); }
-  else void syncNowPlayingVisual(track);
+  else { void syncNowPlayingVisual(track); reconcilePlaybackAfterForeground(); }
   playbackDebug(`visibility-${document.visibilityState}`, { next: trackDebug(track), pausedSourceAlive: hasLivePausedSource(track) });
 });
 document.addEventListener('freeze', () => playbackDebug('document-freeze', { pausedSourceAlive: hasLivePausedSource(tracks.find((entry) => entry.id === currentId)) }));
