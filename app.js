@@ -23,7 +23,7 @@ let restoredPosition = 0, lastStateSaveAt = 0;
 let pendingBackup = null;
 const BACKUP_FORMAT = 'zombie-backup';
 const FULL_BACKUP_LIMIT = 40 * 1024 * 1024;
-const preferences = { layout: 'comfortable', appearance: 'soft', visualMode: 'artwork', playbackRate: 1 };
+const preferences = { layout: 'comfortable', appearance: 'soft', visualMode: 'artwork', playbackRate: 1, sort: 'recent' };
 
 const randomEmoji = () => EMOJIS[Math.floor(Math.random() * EMOJIS.length)];
 const neutralArtist = (value) => {
@@ -201,6 +201,7 @@ async function restorePlayerState() {
 function applyPreferences() {
   document.documentElement.dataset.zombieAppearance = preferences.appearance;
   audio.playbackRate = preferences.playbackRate;
+  if ($('#sortSelect')) $('#sortSelect').value = preferences.sort;
   $('#layoutStatus') && ($('#layoutStatus').textContent = preferences.layout === 'compact' ? 'Compact list' : preferences.layout === 'grid' ? 'Artwork grid' : 'Comfortable list');
   $('#appearanceStatus') && ($('#appearanceStatus').textContent = preferences.appearance === 'pure' ? 'Pure Black' : preferences.appearance === 'ambient' ? 'Artwork Ambient' : 'Soft Black');
   $('#visualStatus') && ($('#visualStatus').textContent = preferences.visualMode === 'animation' ? 'Animation when a song has one' : 'Artwork by default');
@@ -214,6 +215,7 @@ async function restorePreferences() {
     if (['pure', 'soft', 'ambient'].includes(record.appearance)) preferences.appearance = record.appearance;
     if (['artwork', 'animation'].includes(record.visualMode)) preferences.visualMode = record.visualMode;
     if ([0.8, 1, 1.2, 1.5].includes(record.playbackRate)) preferences.playbackRate = record.playbackRate;
+    if (['recent', 'oldest', 'title', 'artist', 'album', 'plays', 'least', 'duration', 'played'].includes(record.sort)) preferences.sort = record.sort;
   }
   applyPreferences();
 }
@@ -301,13 +303,14 @@ function getAudioBlob(id) { return getRecord('audioBlobs', id).then((record) => 
 async function saveArtwork(id, blob) { const oldUrl = artworkUrls.get(id); if (oldUrl) URL.revokeObjectURL(oldUrl); await saveRecord('artworkBlobs', { id, blob }); artworkUrls.delete(id); }
 async function applyArtwork(element, track) {
   const artworkKey = track?.artworkId || '';
+  const previousArtworkKey = element.dataset.artworkKey || '';
   element.dataset.artworkKey = artworkKey;
   element.className = `${element.className.split(' ').filter((name) => !name.startsWith('art-')).join(' ')} art-${artVariant(track)}`;
   element.style.backgroundImage = '';
   element.classList.remove('has-art');
   element.textContent = '';
   if (!track?.artworkId) return;
-  try { const record = await getRecord('artworkBlobs', track.artworkId); if (!record?.blob || element.dataset.artworkKey !== artworkKey) return; let url = artworkUrls.get(track.artworkId); if (!url) { url = URL.createObjectURL(record.blob); artworkUrls.set(track.artworkId, url); } if (element.dataset.artworkKey !== artworkKey) return; element.style.backgroundImage = `url("${url}")`; element.classList.add('has-art'); element.textContent = ''; } catch { /* fall back to local Zombie art */ }
+  try { const record = await getRecord('artworkBlobs', track.artworkId); if (!record?.blob || element.dataset.artworkKey !== artworkKey) return; let url = artworkUrls.get(track.artworkId); if (!url) { url = URL.createObjectURL(record.blob); artworkUrls.set(track.artworkId, url); } if (element.dataset.artworkKey !== artworkKey) return; element.style.backgroundImage = `url("${url}")`; element.classList.add('has-art'); element.textContent = ''; if (previousArtworkKey !== artworkKey) replayVisualClass(element, 'artwork-loaded'); } catch { /* fall back to local Zombie art */ }
 }
 function canUseAnimatedVisual(track = tracks.find((entry) => entry.id === currentId)) {
   return Boolean(track?.visualId && preferences.visualMode === 'animation' && !document.hidden && !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches && !$('#nowPlayingScreen').classList.contains('hidden'));
@@ -766,7 +769,7 @@ function render() {
   document.querySelectorAll('.bottom-nav button').forEach((button) => button.classList.toggle('active', button.dataset.nav === (currentView === 'settings' ? 'settings' : 'library')));
   document.querySelectorAll('.tab').forEach((button) => button.classList.toggle('active', button.dataset.view === currentView && !activePlaylistId));
   if (currentView === 'settings') { refreshStorageStatus(); return; }
-  const area = $('#contentArea'); area.className = `content-area layout-${preferences.layout}`; area.innerHTML = '';
+  const area = $('#contentArea'); area.className = `content-area layout-${preferences.layout}`; area.innerHTML = ''; replayVisualClass(area, 'library-refresh');
   $('#importArea').classList.toggle('hidden', currentView !== 'songs' || Boolean(collectionFilter) || Boolean(activePlaylistId));
   $('#importArea').classList.toggle('library-populated', tracks.length > 0);
   $('#sortSelect').parentElement.classList.toggle('hidden', ['albums', 'artists', 'playlists'].includes(currentView) || Boolean(activePlaylistId));
@@ -961,10 +964,10 @@ async function playTrack(id, sourceIds = null, options = {}) {
 }
 function showMiniPlayer(track) { $('#miniPlayer').classList.remove('hidden'); syncNowPlaying(track); }
 function paintNowPlayingTrack(track, changed = false) {
-  applyAmbientPalette(track); $('#nowTitle').textContent = track.title; $('#nowArtist').textContent = track.artist;
+  applyAmbientPalette(track); setMarqueeText('#nowTitle', track.title); $('#nowArtist').textContent = track.artist;
   applyArtwork($('#miniArt'), track); applyArtwork($('#npArt'), track); applyArtwork($('#npBackdrop'), track);
   $('#npEmoji').textContent = track.emoji; setMarqueeText('#npTitle', track.title); setMarqueeText('#npArtist', track.artist); $('#npAlbum').textContent = track.album || 'Single';
-  $('#npFavorite').textContent = track.isFavorite ? '♥' : '♡'; syncAmbientMotionState(); void syncNowPlayingVisual(track);
+  $('#npFavorite').textContent = track.isFavorite ? '♥' : '♡'; $('#npFavorite').setAttribute('aria-pressed', String(track.isFavorite)); syncAmbientMotionState(); void syncNowPlayingVisual(track);
   if (changed) {
     ['#miniPlayer', '#nowPlayingScreen'].forEach((selector) => {
       const panel = $(selector); panel.classList.remove('track-leaving', 'song-changing', 'artwork-changing');
@@ -1451,7 +1454,7 @@ function wireUI() {
   $('#lyricsInput').onchange = (event) => { importLyricsFile(event.target.files?.[0]); event.target.value = ''; };
   $('#visualInput').onchange = (event) => { saveSelectedVisual(event.target.files?.[0]); event.target.value = ''; };
   $('#backupInput').onchange = (event) => { chooseBackupFile(event.target.files?.[0]); event.target.value = ''; };
-  $('#searchInput').oninput = () => { activePlaylistId = null; render(); }; $('#sortSelect').onchange = render;
+  $('#searchInput').oninput = () => { activePlaylistId = null; render(); }; $('#sortSelect').onchange = (event) => { preferences.sort = event.target.value; savePreferences(); render(); };
   document.querySelectorAll('.tab').forEach((button) => button.onclick = () => { currentView = button.dataset.view; collectionFilter = null; activePlaylistId = null; render(); });
   document.querySelectorAll('.bottom-nav button').forEach((button) => button.onclick = () => { currentView = button.dataset.nav === 'settings' ? 'settings' : 'songs'; collectionFilter = null; activePlaylistId = null; render(); });
   $('#storageRefresh').onclick = refreshStorageStatus; $('#persistenceButton').onclick = requestPersistentStorage; $('#clearMusicButton').onclick = clearAllMusic;
@@ -1483,7 +1486,7 @@ function wireUI() {
   ['waiting', 'stalled', 'suspend', 'emptied', 'abort', 'canplay'].forEach((eventName) => audio.addEventListener(eventName, () => playbackDebug(`audio-${eventName}`)));
   let miniTouch = null, fullTouchY = null, sheetTouchY = null;
   $('#miniPlayer').addEventListener('touchstart', (event) => { if (event.target.closest('#miniPrevious,#miniPlay,#miniNext')) { miniTouch = null; return; } const touch = event.changedTouches[0]; miniTouch = touch ? { x: touch.clientX, y: touch.clientY, direction: null } : null; }, { passive: true });
-  $('#miniPlayer').addEventListener('touchmove', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; if (!miniTouch.direction && Math.max(Math.abs(dx), Math.abs(dy)) > 8) miniTouch.direction = Math.abs(dx) > Math.abs(dy) * 1.25 ? 'horizontal' : 'vertical'; if (miniTouch.direction === 'horizontal') { const offset = Math.max(-30, Math.min(30, dx * 0.22)); $('#miniPlayer').style.transform = `translateX(${offset}px)`; $('#miniPlayer').classList.add('swiping'); } }, { passive: true });
+  $('#miniPlayer').addEventListener('touchmove', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; if (!miniTouch.direction && Math.max(Math.abs(dx), Math.abs(dy)) > 8) miniTouch.direction = Math.abs(dx) > Math.abs(dy) * 1.25 ? 'horizontal' : 'vertical'; if (miniTouch.direction === 'horizontal') { const offset = Math.max(-30, Math.min(30, dx * 0.22)); $('#miniPlayer').style.transform = `translateX(${offset}px)`; $('#miniPlayer').classList.add('swiping'); } else if (miniTouch.direction === 'vertical' && dy < 0) { const lift = Math.max(-10, dy * 0.12); $('#miniPlayer').style.transform = `translateY(${lift}px) scale(1.004)`; $('#miniPlayer').classList.add('swiping'); } }, { passive: true });
   $('#miniPlayer').addEventListener('touchend', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; $('#miniPlayer').style.transform = ''; $('#miniPlayer').classList.remove('swiping'); if (miniTouch.direction === 'horizontal' && Math.abs(dx) > 68) { dx < 0 ? nextTrack() : previousTrack(); } else if (miniTouch.direction !== 'horizontal' && dy < -40 && Math.abs(dy) > Math.abs(dx)) openNowPlaying(); miniTouch = null; }, { passive: true });
   $('#nowPlayingScreen').addEventListener('touchstart', (event) => { fullTouchY = event.target.closest('button,input') ? null : event.changedTouches[0]?.clientY ?? null; }, { passive: true });
   $('#nowPlayingScreen').addEventListener('touchmove', (event) => {
@@ -1520,7 +1523,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); $('#remainingTime').textContent = formatRemainingTime((track.duration || 0) - restoredPosition); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=31').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=32').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
