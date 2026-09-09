@@ -1592,7 +1592,7 @@ function openAddMusicMenu() {
   $('#sheetTitle').textContent = 'Add music';
   $('#sheetContent').innerHTML = `<button id="addMusicFiles" class="import-choice"><i>♫</i><span><strong>Import Files</strong><small>Choose music or screen recordings already on this iPhone.</small></span><b>›</b></button><button id="addMusicLink" class="import-choice import-choice-link"><i>↗</i><span><strong>Import from Link</strong><small>Use a YouTube or direct-audio link, then save the downloaded file offline.</small></span><b>›</b></button><p class="sheet-note import-privacy-note">Zombie never streams YouTube inside the player. Imported files stay in your local library.</p>`;
   $('#addMusicFiles').onclick = () => { $('#fileInput').click(); closeSheet(); };
-  $('#addMusicLink').onclick = openLinkImporter;
+  $('#addMusicLink').onclick = () => openLinkImporter();
   showSheet();
 }
 function setLinkImportFeedback(message = '', kind = '') { const note = $('#linkImportFeedback'); if (!note) return; note.textContent = message; note.className = `link-import-feedback ${kind}`; }
@@ -2016,7 +2016,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.1').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
