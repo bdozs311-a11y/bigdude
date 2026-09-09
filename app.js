@@ -956,7 +956,17 @@ async function playTrack(id, sourceIds = null, options = {}) {
   } else if (!queue.includes(id)) {
     queue = uniquePlayableIds(visibleTracks().map((entry) => entry.id)); queueIndex = queue.indexOf(id);
     if (shuffleOn) refillShuffleBag(id);
-  } else queueIndex = queue.indexOf(id);
+  } else {
+    queueIndex = queue.indexOf(id);
+    // A manual jump inside an existing shuffled session consumes that upcoming item.
+    // Internal next/previous/queue actions already manage the bag themselves.
+    const managedShuffleTransition = ['next', 'ended', 'previous', 'queue-jump'].includes(options.reason);
+    if (shuffleOn && id !== currentId && !managedShuffleTransition) {
+      if (currentId && !shuffleHistory.includes(currentId)) shuffleHistory.push(currentId);
+      shuffleBag = shuffleBag.filter((entry) => entry !== id);
+      shuffleHistory = shuffleHistory.filter((entry) => entry !== id);
+    }
+  }
   if (currentId === id && audio.src) {
     if (audio.paused) {
       if (audio.ended) audio.currentTime = 0;
@@ -1200,7 +1210,7 @@ function reconcilePlaybackAfterForeground() {
 }
 async function previousTrack() {
   if (audio.currentTime > 3) { audio.currentTime = 0; return; }
-  if (shuffleOn && shuffleHistory.length) { const id = shuffleHistory.pop(); if (currentId) shuffleBag.unshift(currentId); await playTrack(id); return; }
+  if (shuffleOn && shuffleHistory.length) { const id = shuffleHistory.pop(); if (currentId) shuffleBag.unshift(currentId); await playTrack(id, null, { reason: 'previous' }); return; }
   if (!queue.length) return;
   if (queueIndex > 0) { queueIndex -= 1; await playTrack(queue[queueIndex]); }
   else if (repeatMode === 'all') { queueIndex = queue.length - 1; await playTrack(queue[queueIndex]); }
