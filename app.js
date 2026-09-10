@@ -13,7 +13,10 @@ let pausedResumeSnapshot = null, mediaResumeAttempt = 0;
 let playbackEpoch = 0, lastHandledEndedEpoch = -1, foregroundRecoveryToken = 0;
 const retiredAudioUrls = new Set();
 let currentView = 'songs', collectionFilter = null, activePlaylistId = null;
+// One view-independent playback context. Library shelves only choose the initial
+// contents; every player control below reads and updates this same active queue.
 let queue = [], queueIndex = -1, shuffleOn = false, shuffleBag = [], shuffleHistory = [];
+let activeQueueSource = 'library';
 let repeatMode = 'off';
 let artTarget = null, lyricsTarget = null, visualTarget = null, activeLyricsId = null, lastLyricsIndex = -1, visualLoadToken = 0;
 let lyricsSyncDraft = null, lyricsManualScrollUntil = 0, lyricsAutoScrollUntil = 0;
@@ -232,7 +235,7 @@ function saveRecord(name, record) {
 function savePlayerState(force = false) {
   if (!db) return;
   const now = Date.now(); if (!force && now - lastStateSaveAt < 3500) return; lastStateSaveAt = now;
-  const state = { key: 'playerState', currentId, queue, queueIndex, shuffleOn, shuffleBag, shuffleHistory, repeatMode, volume: audio.volume, position: Number.isFinite(audio.currentTime) ? audio.currentTime : restoredPosition };
+  const state = { key: 'playerState', currentId, queue, queueIndex, activeQueueSource, shuffleOn, shuffleBag, shuffleHistory, repeatMode, volume: audio.volume, position: Number.isFinite(audio.currentTime) ? audio.currentTime : restoredPosition };
   saveRecord('settings', state).catch(() => {});
 }
 async function restorePlayerState() {
@@ -242,6 +245,7 @@ async function restorePlayerState() {
   currentId = tracks.some((track) => track.id === state.currentId) ? state.currentId : null;
   const savedIndex = Number.isInteger(state.queueIndex) ? state.queueIndex : -1;
   queueIndex = queue[savedIndex] === currentId ? savedIndex : Math.max(0, queue.indexOf(currentId));
+  activeQueueSource = typeof state.activeQueueSource === 'string' && state.activeQueueSource ? state.activeQueueSource.slice(0, 120) : 'library';
   shuffleOn = Boolean(state.shuffleOn); repeatMode = ['off', 'all', 'one'].includes(state.repeatMode) ? state.repeatMode : 'off';
   shuffleBag = Array.isArray(state.shuffleBag) ? state.shuffleBag.filter((id) => queue.includes(id)) : [];
   shuffleHistory = Array.isArray(state.shuffleHistory) ? state.shuffleHistory.filter((id) => queue.includes(id)) : [];
@@ -918,7 +922,7 @@ function animatePlaybackControls(state) {
 function animateSkip(direction) { replayVisualClass($('#nowPlayingScreen'), direction === 'next' ? 'skip-forward' : 'skip-backward'); replayVisualClass($('#miniPlayer'), direction === 'next' ? 'skip-forward' : 'skip-backward'); }
 function playbackDebug(stage, details = {}) {
   console.info(`[Zombie BG] ${stage}`, {
-    previous: details.previous || null, next: details.next || null, queueIndex, queueLength: queue.length, shuffleOn, repeatMode,
+    previous: details.previous || null, next: details.next || null, queueIndex, queueLength: queue.length, activeQueueSource, shuffleOn, repeatMode,
     readyState: audio.readyState, networkState: audio.networkState, paused: audio.paused, ended: audio.ended,
     currentTime: audio.currentTime, duration: audio.duration, src: audio.currentSrc || audio.src || '', blobLoaded: details.blobLoaded,
     error: audioErrorDebug(), mediaPlaybackState: navigator.mediaSession?.playbackState || null, visibility: document.visibilityState,
@@ -1151,6 +1155,28 @@ function visibleTracks() {
   }
   return list;
 }
+function queueSourceForCurrentView() {
+  const search = $('#searchInput')?.value.trim();
+  if (search) return 'search-results';
+  if (activePlaylistId) return `playlist:${activePlaylistId}`;
+  if (collectionFilter?.type) return `${collectionFilter.type}:${collectionFilter.value || 'library'}`;
+  if (currentView === 'played') return 'recently-played';
+  if (currentView === 'favorites') return 'favorites';
+  if (currentView === 'recent') return 'recently-added';
+  return `library:${currentView || 'songs'}`;
+}
+function activatePlaybackQueue(ids, selectedId, source = queueSourceForCurrentView()) {
+  const nextQueue = uniquePlayableIds(ids);
+  if (!nextQueue.includes(selectedId) && tracks.some((track) => track.id === selectedId)) nextQueue.unshift(selectedId);
+  if (!nextQueue.length) return false;
+  queue = nextQueue;
+  queueIndex = queue.indexOf(selectedId);
+  activeQueueSource = source || 'library';
+  shuffleHistory = [];
+  shuffleBag = shuffleOn ? randomize(queue.filter((id) => id !== selectedId)) : [];
+  playbackDebug('active-queue-created', { next: trackDebug(tracks.find((track) => track.id === selectedId)), activeQueueSource, activeQueueLength: queue.length, shuffleBagLength: shuffleBag.length });
+  return true;
+}
 function showEmptyState({ icon = '☠', title = 'Your library is waiting', message = 'Import music once, then keep listening offline.', action = null } = {}) {
   const state = $('#emptyState');
   state.style.display = 'block';
@@ -1179,16 +1205,16 @@ function render() {
   else {
     const list = visibleTracks();
     if (currentView === 'songs' && !collectionFilter && !$('#searchInput').value.trim() && tracks.length) renderHomeShelves(area);
-    renderTrackList(area, list);
+    renderTrackList(area, list, null, queueSourceForCurrentView());
   }
 }
-function appendHomeShelf(area, title, subtitle, list) {
+function appendHomeShelf(area, title, subtitle, list, activeQueueIds = list.map((track) => track.id), queueSource = 'home-shelf') {
   if (!list.length) return;
   const shelf = document.createElement('section'); shelf.className = 'home-shelf';
   shelf.innerHTML = `<div class="home-shelf-heading"><h2>${escapeHTML(title)}</h2><span>${escapeHTML(subtitle)}</span></div><div class="home-card-row">${list.map((track) => `<button class="home-song-card ${track.id === currentId ? 'current' : ''}" data-home-track="${track.id}" aria-label="Play ${escapeHTML(track.title)}"><span class="cover art-${artVariant(track)}" data-home-art="${track.id}">Z</span><span><strong>${escapeHTML(track.title)}</strong><small>${escapeHTML(track.artist)}</small></span></button>`).join('')}</div>`;
   shelf.querySelectorAll('[data-home-track]').forEach((button) => {
     const track = tracks.find((entry) => entry.id === button.dataset.homeTrack); if (!track) return;
-    button.onclick = () => { const source = list.map((entry) => entry.id); void playTrack(track.id, source); };
+    button.onclick = () => { void playTrack(track.id, activeQueueIds, { queueSource }); };
     applyArtwork(button.querySelector('[data-home-art]'), track);
   });
   area.append(shelf);
@@ -1201,14 +1227,15 @@ function renderHomeShelves(area) {
     : '<p>YOUR MUSIC. YOUR RULES.</p><strong>Built for your local library.</strong><small>Offline-ready playback, your playlists, your lyrics.</small>';
   if (current) hero.onclick = openNowPlaying;
   area.append(hero);
-  const recentlyPlayed = tracks.filter((track) => track.lastPlayed).sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0)).slice(0, 8);
-  const favorites = tracks.filter((track) => track.isFavorite).sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0)).slice(0, 8);
-  const recentlyAdded = [...tracks].sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0)).slice(0, 8);
-  if (recentlyPlayed.length) appendHomeShelf(area, 'Recently played', 'Pick up where you left off', recentlyPlayed);
-  if (favorites.length) appendHomeShelf(area, 'Favorites', 'Saved on this device', favorites);
-  appendHomeShelf(area, 'Recently added', 'Your latest imports', recentlyAdded);
+  const playedQueue = tracks.filter((track) => track.lastPlayed).sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
+  const favoritesQueue = tracks.filter((track) => track.isFavorite).sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
+  const addedQueue = [...tracks].sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+  const recentlyPlayed = playedQueue.slice(0, 8), favorites = favoritesQueue.slice(0, 8), recentlyAdded = addedQueue.slice(0, 8);
+  if (recentlyPlayed.length) appendHomeShelf(area, 'Recently played', 'Pick up where you left off', recentlyPlayed, playedQueue.map((track) => track.id), 'recently-played');
+  if (favorites.length) appendHomeShelf(area, 'Favorites', 'Saved on this device', favorites, favoritesQueue.map((track) => track.id), 'favorites');
+  appendHomeShelf(area, 'Recently added', 'Your latest imports', recentlyAdded, addedQueue.map((track) => track.id), 'recently-added');
 }
-function renderTrackList(area, list, playlist = null) {
+function renderTrackList(area, list, playlist = null, queueSource = queueSourceForCurrentView()) {
   $('#librarySummary').textContent = libraryStats(list);
   if (list.length) hideEmptyState();
   if (collectionFilter && !playlist) {
@@ -1231,7 +1258,7 @@ function renderTrackList(area, list, playlist = null) {
   list.forEach((track, position) => {
     const item = document.createElement('article'); item.className = `track ${track.id === currentId ? 'active' : ''}`;
     item.innerHTML = `<button class="track-main" aria-label="Play ${escapeHTML(track.title)}"><span class="cover art-${artVariant(track)}" data-art="${track.id}">Z</span><span class="track-copy"><strong><i class="title-emoji">${track.emoji}</i>${escapeHTML(track.title)}${track.id === currentId && !audio.paused ? '<span class="playing-bars" aria-label="Playing"><i></i><i></i><i></i></span>' : ''}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album)}${track.genre ? ` · <em>${escapeHTML(track.genre)}</em>` : ''}${lyricsStatusMarkup(track)}</small></span></button><button class="favorite ${track.isFavorite ? 'selected' : ''}" aria-label="${track.isFavorite ? 'Remove from' : 'Add to'} favorites">${track.isFavorite ? '♥' : '♡'}</button><button class="more" aria-label="Song options">⋯</button>${playlist ? `<span class="reorder"><button aria-label="Move song up">↑</button><button aria-label="Move song down">↓</button><button aria-label="Remove from playlist">×</button></span>` : '<button class="delete" aria-label="Delete from device">×</button>'}`;
-    item.querySelector('.track-main').onclick = () => playTrack(track.id, list.map((entry) => entry.id));
+    item.querySelector('.track-main').onclick = () => playTrack(track.id, list.map((entry) => entry.id), { queueSource });
     item.querySelector('.favorite').onclick = () => toggleFavorite(track.id);
     item.querySelector('.more').onclick = () => openSongOptions(track.id);
     if (playlist) {
@@ -1318,11 +1345,13 @@ function renderPlaylistDetail(area) {
   const controls = document.createElement('div'); controls.className = 'playlist-controls';
   controls.innerHTML = '<button class="back-link">‹ Playlists</button><button class="primary-button">Play</button><button class="secondary-button">Shuffle</button><button class="secondary-button" data-playlist-sort>Sort</button><button class="secondary-button" data-smart-order>Smart order</button>';
   controls.querySelector('.back-link').onclick = () => { activePlaylistId = null; currentView = 'playlists'; render(); };
-  controls.querySelector('.primary-button').onclick = () => { if (list.length) { shuffleOn = false; updatePlayerMode(); playTrack(list[0].id, ids); } else toast('This playlist is empty'); };
-  controls.querySelector('.secondary-button').onclick = () => { if (list.length) { const first = list[Math.floor(Math.random() * list.length)]; shuffleOn = true; playTrack(first.id, ids, { reason: 'playlist-shuffle' }); updatePlayerMode(); } else toast('This playlist is empty'); };
+  const playlistQueueSource = `playlist:${playlist.id}`;
+  // "Play" keeps the global Shuffle choice instead of silently turning it off.
+  controls.querySelector('.primary-button').onclick = () => { if (list.length) { void playTrack(list[0].id, ids, { queueSource: playlistQueueSource }); } else toast('This playlist is empty'); };
+  controls.querySelector('.secondary-button').onclick = () => { if (list.length) { const first = list[Math.floor(Math.random() * list.length)]; shuffleOn = true; void playTrack(first.id, ids, { reason: 'playlist-shuffle', queueSource: playlistQueueSource }); updatePlayerMode(); } else toast('This playlist is empty'); };
   controls.querySelector('[data-playlist-sort]').onclick = () => openPlaylistSort(playlist.id);
   controls.querySelector('[data-smart-order]').onclick = () => { void smartOrderPlaylist(playlist.id); };
-  area.append(controls); renderTrackList(area, list, playlist);
+  area.append(controls); renderTrackList(area, list, playlist, playlistQueueSource);
 }
 
 async function playTrack(id, sourceIds = null, options = {}) {
@@ -1335,11 +1364,9 @@ async function playTrack(id, sourceIds = null, options = {}) {
   const oldUrl = pendingAudio?.url || currentUrl;
   if (pendingAudio) { playbackDebug('pending-transition-superseded', { previous: pendingAudio.previous, next: trackDebug(track) }); pendingAudio = null; }
   if (sourceIds?.length) {
-    queue = uniquePlayableIds(sourceIds); queueIndex = queue.indexOf(id);
-    if (shuffleOn) { shuffleBag = randomize(queue.filter((entry) => entry !== id)); shuffleHistory = []; }
+    activatePlaybackQueue(sourceIds, id, options.queueSource || queueSourceForCurrentView());
   } else if (!queue.includes(id)) {
-    queue = uniquePlayableIds(visibleTracks().map((entry) => entry.id)); queueIndex = queue.indexOf(id);
-    if (shuffleOn) refillShuffleBag(id);
+    activatePlaybackQueue(visibleTracks().map((entry) => entry.id), id, options.queueSource || queueSourceForCurrentView());
   } else {
     queueIndex = queue.indexOf(id);
     // A manual jump inside an existing shuffled session consumes that upcoming item.
@@ -2447,7 +2474,7 @@ async function clearAllMusic() {
   transaction.objectStore('settings').delete('playlistFolders');
   await new Promise((resolve, reject) => { transaction.oncomplete = resolve; transaction.onerror = () => reject(transaction.error); });
   audio.pause(); audio.removeAttribute('src'); audio.load(); if (currentUrl) URL.revokeObjectURL(currentUrl);
-  tracks = []; playlists = []; playlistFolders = []; queue = []; currentId = null; currentUrl = null; activePlaylistId = null; $('#miniPlayer').classList.add('hidden'); render(); refreshStorageStatus(); toast('All music cleared from this device');
+  tracks = []; playlists = []; playlistFolders = []; queue = []; queueIndex = -1; activeQueueSource = 'library'; currentId = null; currentUrl = null; activePlaylistId = null; $('#miniPlayer').classList.add('hidden'); render(); refreshStorageStatus(); toast('All music cleared from this device');
 }
 
 function wireUI() {
@@ -2535,7 +2562,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.4').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.5').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
