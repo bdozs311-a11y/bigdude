@@ -1758,7 +1758,7 @@ async function fetchDirectAudioForImport(source) {
 }
 function findPossibleDuplicate(file, metadata, source) {
   const fingerprint = `${file.name}|${file.size}|${file.lastModified}`;
-  return tracks.find((track) => track.fingerprint === fingerprint || (source?.url && track.sourceUrl === source.url) || ((track.fileName || '') === file.name && Number(track.size) === Number(file.size)) || ((track.title || '') === metadata.title && (track.artist || '') === metadata.artist && Math.abs((Number(track.duration) || 0) - (Number(metadata.duration) || 0)) < 1));
+  return tracks.find((track) => track.fingerprint === fingerprint || (source?.url && track.sourceUrl === source.url) || (source?.videoId && track.sourceVideoId === source.videoId) || ((track.fileName || '') === file.name && Number(track.size) === Number(file.size)) || ((track.title || '') === metadata.title && (track.artist || '') === metadata.artist && Math.abs((Number(track.duration) || 0) - (Number(metadata.duration) || 0)) < 1));
 }
 function clearLinkImportDraft() {
   if (linkImportDraft?.previewUrl) URL.revokeObjectURL(linkImportDraft.previewUrl);
@@ -1847,7 +1847,7 @@ async function saveLinkImportDraft() {
     const saveButton = $('#saveLinkImport'); if (saveButton) { saveButton.disabled = true; saveButton.textContent = 'Saving…'; }
     showProgress('Importing audio…', title);
     const track = { id: crypto.randomUUID(), ...draft.metadata, title, artist, album, fileName: file.name, type: file.type || 'audio/mpeg', size: file.size, fingerprint, emoji: randomEmoji(), isFavorite: false, genre: '', lyrics: draft.embeddedLyrics?.lyrics || '', syncedLyrics: draft.embeddedLyrics?.syncedLyrics || [], playCount: 0, addedAt: Date.now(), blobStored: true };
-    if (draft.source?.url) { track.sourceUrl = draft.source.url; track.sourceName = draft.source.label; }
+    if (draft.source?.url) { track.sourceUrl = draft.source.url; track.sourceName = draft.source.label; track.sourceVideoId = draft.source.videoId || ''; track.sourceNormalizedUrl = draft.source.normalizedUrl || draft.source.url; }
     await saveTrack(track, file); tracks.unshift(track);
     showProgress('Saving offline…', 'Adding it to your local library');
     if (draft.artwork) { try { track.artworkId = `track:${track.id}`; await saveArtwork(track.artworkId, draft.artwork); await saveRecord('tracks', track); } catch { delete track.artworkId; /* Audio remains safely imported if optional artwork cannot be stored. */ } }
