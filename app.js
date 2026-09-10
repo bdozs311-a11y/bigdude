@@ -22,7 +22,8 @@ let panelTimer = null, lastVisualTrackId = null, visualTransitionToken = 0, acti
 let sleepTimerHandle = null, sleepTimerEndsAt = 0, sleepAfterCurrent = false, playlistDragTrackId = null;
 let restoredPosition = 0, lastStateSaveAt = 0;
 let pendingBackup = null;
-let linkImportContext = null, linkImportDraft = null;
+let linkImportContext = null, linkImportDraft = null, pendingLinkImport = null, linkImportSaving = false;
+const PENDING_IMPORT_KEY = 'pendingLinkImport';
 const BACKUP_FORMAT = 'zombie-backup';
 const FULL_BACKUP_LIMIT = 40 * 1024 * 1024;
 const preferences = { layout: 'comfortable', appearance: 'soft', visualMode: 'artwork', playbackRate: 1, sort: 'recent', dynamicColours: 'balanced', colourIntensity: 'medium', zombieAccent: 'purple', visualEffects: true, timeDisplay: 'remaining', reduceAnimations: false };
@@ -952,6 +953,7 @@ function render() {
   $('#settingsScreen').classList.toggle('hidden', currentView !== 'settings');
   document.querySelectorAll('.bottom-nav button').forEach((button) => button.classList.toggle('active', button.dataset.nav === (currentView === 'settings' ? 'settings' : 'library')));
   document.querySelectorAll('.tab').forEach((button) => button.classList.toggle('active', button.dataset.view === currentView && !activePlaylistId));
+  updatePendingImportCard();
   if (currentView === 'settings') { refreshStorageStatus(); return; }
   const area = $('#contentArea'); area.className = `content-area layout-${preferences.layout}`; area.innerHTML = ''; replayVisualClass(area, 'library-refresh');
   $('#importArea').classList.toggle('hidden', currentView !== 'songs' || Boolean(collectionFilter) || Boolean(activePlaylistId));
@@ -1574,6 +1576,15 @@ async function importFiles(fileList) {
 }
 
 function isImportableAudioFile(file) { return Boolean(file && ((file.type || '').startsWith('audio/') || (file.type || '').startsWith('video/') || SUPPORTED_FILES.test(file.name || ''))); }
+function youTubeVideoId(value) {
+  try {
+    const url = value instanceof URL ? value : new URL(String(value || ''));
+    const host = url.hostname.replace(/^www\./i, '').toLowerCase();
+    if (host === 'youtu.be') return url.pathname.split('/').filter(Boolean)[0] || '';
+    if (!host.endsWith('youtube.com')) return '';
+    return url.searchParams.get('v') || (/^\/(?:shorts|embed|live)\/([^/?#]+)/i.exec(url.pathname)?.[1] || '');
+  } catch { return ''; }
+}
 function isYouTubeLink(url) {
   const host = url.hostname.replace(/^www\./i, '').toLowerCase();
   return (host === 'youtu.be' && url.pathname.length > 1) || (host.endsWith('youtube.com') && (Boolean(url.searchParams.get('v')) || /^\/(shorts|embed|live)\//i.test(url.pathname)));
@@ -1583,10 +1594,79 @@ function inspectImportLink(value) {
   try {
     const url = new URL(String(value || '').trim());
     if (!/^https?:$/i.test(url.protocol)) return null;
-    if (isYouTubeLink(url)) return { kind: 'youtube', label: 'YouTube', url: url.href };
+    if (isYouTubeLink(url)) {
+      const videoId = youTubeVideoId(url);
+      return { kind: 'youtube', label: 'YouTube', url: url.href, originalUrl: url.href, normalizedUrl: `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`, videoId };
+    }
     if (isDirectAudioLink(url)) return { kind: 'direct', label: 'Direct audio', url: url.href };
   } catch { /* Keep the simple inline validation message. */ }
   return null;
+}
+function pendingSource(pending = pendingLinkImport) {
+  if (!pending?.sourceUrl) return null;
+  return { kind: pending.sourceType || 'youtube', label: pending.sourceName || 'YouTube', url: pending.sourceUrl, originalUrl: pending.sourceUrl, normalizedUrl: pending.normalizedUrl || pending.sourceUrl, videoId: pending.videoId || '' };
+}
+function pendingImportAge(pending = pendingLinkImport) {
+  const age = Math.max(0, Date.now() - Number(pending?.startedAt || Date.now()));
+  const days = Math.floor(age / 86400000);
+  return days ? `${days} day${days === 1 ? '' : 's'} ago` : 'Started today';
+}
+function cleanImportTitle(value = '') {
+  return String(value || '')
+    .replace(/\.[a-z0-9]{2,5}$/i, '')
+    .replace(/[._]+/g, ' ')
+    .replace(/\s*[-–—|]\s*(official\s+)?(?:music\s+)?(?:video|audio)(?:\s*\[[^\]]*\])?$/i, '')
+    .replace(/\s*\((?:official\s+)?(?:music\s+)?(?:video|audio)\)$/i, '')
+    .replace(/\s+(?:mp3|m4a|audio download)$/i, '')
+    .replace(/\s{2,}/g, ' ').trim() || 'Untitled song';
+}
+async function savePendingImport(source, stage = 'convert') {
+  if (!source?.url) return null;
+  const existing = pendingLinkImport?.sourceUrl === source.url ? pendingLinkImport : null;
+  const next = {
+    key: PENDING_IMPORT_KEY,
+    sourceUrl: source.url,
+    normalizedUrl: source.normalizedUrl || source.url,
+    sourceName: source.label || 'Downloaded audio',
+    sourceType: source.kind || 'file',
+    videoId: source.videoId || '',
+    titleSuggestion: existing?.titleSuggestion || (source.kind === 'youtube' ? 'YouTube audio' : cleanImportTitle(source.url)),
+    startedAt: existing?.startedAt || Date.now(),
+    updatedAt: Date.now(),
+    stage,
+  };
+  pendingLinkImport = next;
+  await saveRecord('settings', next);
+  updatePendingImportCard();
+  return next;
+}
+async function restorePendingImport() {
+  const saved = await getRecord('settings', PENDING_IMPORT_KEY).catch(() => null);
+  if (!saved?.sourceUrl) return;
+  pendingLinkImport = saved;
+  linkImportContext = pendingSource(saved);
+}
+async function clearPendingImport() {
+  pendingLinkImport = null;
+  await deleteRecord('settings', PENDING_IMPORT_KEY).catch(() => {});
+  updatePendingImportCard();
+}
+function updatePendingImportCard() {
+  const card = $('#pendingImportCard'); if (!card) return;
+  const pending = pendingLinkImport;
+  const show = Boolean(pending && currentView !== 'settings');
+  card.classList.toggle('hidden', !show);
+  if (!show) { card.innerHTML = ''; return; }
+  const label = pending.sourceType === 'youtube' ? 'YouTube link' : (pending.sourceName || 'Audio link');
+  const stale = Date.now() - Number(pending.startedAt || 0) > 7 * 86400000;
+  card.innerHTML = `<div class="pending-import-icon">↓</div><div class="pending-import-copy"><strong>Finish your import</strong><small>${escapeHTML(label)} · ${pendingImportAge(pending)}${stale ? ' · Still available' : ''}</small></div><button id="finishPendingImport" class="pending-import-primary">Import Downloaded Audio</button><button id="cancelPendingImport" class="pending-import-cancel" aria-label="Cancel pending import">×</button>`;
+  $('#finishPendingImport').onclick = () => chooseDownloadedLinkAudio(pendingSource(pending));
+  $('#cancelPendingImport').onclick = async () => { await clearPendingImport(); toast('Pending import cancelled'); };
+}
+function importSteps(active = 'link') {
+  const steps = [['link', 'Link'], ['convert', 'Convert'], ['import', 'Import'], ['done', 'Done']];
+  const current = steps.findIndex(([key]) => key === active);
+  return `<ol class="import-steps" aria-label="Import progress">${steps.map(([key, label], index) => `<li class="${index < current ? 'complete' : ''} ${key === active ? 'active' : ''}"><i>${index < current ? '✓' : index + 1}</i><span>${label}</span></li>`).join('')}</ol>`;
 }
 function openAddMusicMenu() {
   $('#sheetTitle').textContent = 'Add music';
@@ -1596,25 +1676,35 @@ function openAddMusicMenu() {
   showSheet();
 }
 function setLinkImportFeedback(message = '', kind = '') { const note = $('#linkImportFeedback'); if (!note) return; note.textContent = message; note.className = `link-import-feedback ${kind}`; }
-function openLinkImporter(value = linkImportContext?.url || '') {
+function openLinkImporter(value = linkImportContext?.url || pendingLinkImport?.sourceUrl || '') {
   $('#sheetTitle').textContent = 'Import from Link';
-  $('#sheetContent').innerHTML = `<section class="link-import-intro"><i>↗</i><span><strong>Bring your own audio</strong><small>Paste a YouTube link for the assisted converter, or a direct audio-file link.</small></span></section><label class="link-import-field">Paste YouTube or audio link<input id="linkImportUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://…" value="${escapeHTML(value)}"></label><p id="linkImportFeedback" class="link-import-feedback" role="status"></p><div class="link-import-actions"><button id="pasteLinkImport" class="sheet-option">▣ Paste from Clipboard</button><button id="continueLinkImport" class="link-import-continue">Continue</button></div><div class="link-import-divider"><span>Already downloaded the audio?</span></div><button id="chooseDownloadedLinkAudio" class="sheet-option">♫ Import Downloaded Audio</button><p class="sheet-note import-privacy-note">Clipboard is only read after you tap Paste. You can always tap and hold the field to paste normally.</p>`;
-  const continueWithLink = () => {
+  $('#sheetContent').innerHTML = `${importSteps('link')}<section class="link-import-intro"><i>↗</i><span><strong>Bring your own audio</strong><small>Paste a YouTube link for the assisted converter, or a direct audio-file link.</small></span></section><label class="link-import-field">Paste YouTube or audio link<span class="link-url-wrap"><input id="linkImportUrl" type="url" inputmode="url" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="https://…" value="${escapeHTML(value)}"><button id="clearLinkImportUrl" class="link-clear-button" aria-label="Clear link">×</button></span></label><p id="linkImportFeedback" class="link-import-feedback" role="status"></p><div class="link-import-actions"><button id="pasteLinkImport" class="sheet-option">▣ Paste from Clipboard</button><button id="continueLinkImport" class="link-import-continue">Continue</button></div><div class="link-import-divider"><span>Already downloaded the audio?</span></div><button id="chooseDownloadedLinkAudio" class="sheet-option">♫ Import Downloaded Audio</button><p class="sheet-note import-privacy-note">Clipboard is only read after you tap Paste. You can always tap and hold the field to paste normally.</p>`;
+  const updateLinkReady = () => {
+    const valid = inspectImportLink($('#linkImportUrl').value);
+    $('#pasteLinkImport').textContent = valid ? '✓ Link ready' : '▣ Paste from Clipboard';
+    $('#pasteLinkImport').classList.toggle('link-ready', Boolean(valid));
+    if (valid) setLinkImportFeedback(valid.kind === 'youtube' ? 'YouTube link ready' : 'Direct audio link ready', 'success');
+  };
+  const continueWithLink = async () => {
     const source = inspectImportLink($('#linkImportUrl').value);
     if (!source) { setLinkImportFeedback("That link doesn't look valid.", 'error'); return; }
     linkImportContext = source;
-    if (source.kind === 'youtube') openConverterStep(source); else openDirectAudioStep(source);
+    if (source.kind === 'youtube') { await savePendingImport(source, 'convert'); openConverterStep(source); }
+    else openDirectAudioStep(source);
   };
   $('#pasteLinkImport').onclick = async () => {
     try {
       const text = await navigator.clipboard?.readText?.();
       if (!text) throw new Error('empty');
-      $('#linkImportUrl').value = text.trim(); setLinkImportFeedback('Link pasted', 'success'); toast('Link pasted');
+      $('#linkImportUrl').value = text.trim(); updateLinkReady(); toast('Link pasted');
     } catch { setLinkImportFeedback('Clipboard paste is unavailable here. Tap and hold the field to paste.', 'error'); }
   };
   $('#continueLinkImport').onclick = continueWithLink;
+  $('#clearLinkImportUrl').onclick = () => { $('#linkImportUrl').value = ''; setLinkImportFeedback(''); updateLinkReady(); $('#linkImportUrl').focus(); };
+  $('#linkImportUrl').addEventListener('input', updateLinkReady);
   $('#linkImportUrl').addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); continueWithLink(); } });
   $('#chooseDownloadedLinkAudio').onclick = () => chooseDownloadedLinkAudio(linkImportContext);
+  updateLinkReady();
   showSheet();
 }
 async function copyLinkForConverter(source) {
@@ -1622,18 +1712,20 @@ async function copyLinkForConverter(source) {
   catch { toast('Copy the link from the field if the converter asks for it'); }
 }
 function openConverterStep(source) {
+  const returned = pendingLinkImport?.sourceUrl === source.url && pendingLinkImport?.stage === 'converter-opened';
   $('#sheetTitle').textContent = 'Convert then import';
-  $('#sheetContent').innerHTML = `<section class="link-import-intro"><i>▶</i><span><strong>YouTube link ready</strong><small>Zombie keeps playback local, so conversion happens outside the app.</small></span></section><ol class="converter-steps"><li>Open the converter and paste your copied link.</li><li>Download the audio file to Files.</li><li>Return here and choose the downloaded audio.</li></ol><button id="openLinkConverter" class="link-import-continue">Open Converter</button><button id="copyLinkForConverter" class="sheet-option">▣ Copy Link</button><button id="importConvertedAudio" class="sheet-option">♫ Import Downloaded Audio</button><p class="sheet-note import-privacy-note">Only download videos or audio you own or are allowed to save. Zombie does not use converter APIs or stream the original video.</p>`;
-  $('#openLinkConverter').onclick = async () => { await copyLinkForConverter(source); const opened = window.open('https://cnvmp3.com/v55', '_blank', 'noopener,noreferrer'); if (!opened) toast('Open the converter in Safari, then paste your copied link'); else toast('Open the converter to continue'); };
+  $('#sheetContent').innerHTML = `${importSteps(returned ? 'import' : 'convert')}<section class="link-import-intro"><i>▶</i><span><strong>${returned ? 'Ready to finish?' : 'YouTube link ready'}</strong><small>${returned ? 'Choose the audio you downloaded to Files.' : 'Zombie keeps playback local, so conversion happens outside the app.'}</small></span></section><ol class="converter-steps"><li>Open the converter and paste your copied link.</li><li>Download the audio file to Files.</li><li>Return here and choose the downloaded audio.</li></ol>${returned ? '<button id="importConvertedAudio" class="link-import-continue">♫ Import Downloaded Audio</button><button id="openLinkConverter" class="sheet-option">Open Converter Again</button>' : '<button id="openLinkConverter" class="link-import-continue">Open Converter</button><button id="importConvertedAudio" class="sheet-option">♫ Import Downloaded Audio</button>'}<button id="copyLinkForConverter" class="sheet-option">▣ Copy Link</button><p class="sheet-note import-privacy-note">Only download videos or audio you own or are allowed to save. Zombie does not use converter APIs or stream the original video.</p>`;
+  $('#openLinkConverter').onclick = async () => { await copyLinkForConverter(source); await savePendingImport(source, 'converter-opened'); const opened = window.open('https://cnvmp3.com/v55', '_blank', 'noopener,noreferrer'); if (!opened) toast('Open the converter in Safari, then paste your copied link'); else toast('Open the converter to continue'); };
   $('#copyLinkForConverter').onclick = () => { void copyLinkForConverter(source); };
   $('#importConvertedAudio').onclick = () => chooseDownloadedLinkAudio(source);
   showSheet();
 }
 function openDirectAudioStep(source) {
   $('#sheetTitle').textContent = 'Import direct audio';
-  $('#sheetContent').innerHTML = `<section class="link-import-intro"><i>♫</i><span><strong>Direct audio link</strong><small>Zombie can try a normal browser download only when the website allows it.</small></span></section><button id="tryDirectAudioImport" class="link-import-continue">Import Direct Audio</button><button id="chooseDirectDownloadedAudio" class="sheet-option">♫ Import Downloaded Audio</button><p class="sheet-note import-privacy-note">No security protections are bypassed. If the website blocks the download, save the file in Safari/Files first, then import it here.</p>`;
+  $('#sheetContent').innerHTML = `${importSteps('import')}<section class="link-import-intro"><i>♫</i><span><strong>Direct audio link</strong><small>Zombie can try a normal browser download only when the website allows it.</small></span></section><button id="tryDirectAudioImport" class="link-import-continue">Import Direct Audio</button><button id="chooseDirectDownloadedAudio" class="sheet-option">♫ Import Downloaded Audio</button><button id="openDirectSource" class="sheet-option">Open Link in Safari</button><p class="sheet-note import-privacy-note">No security protections are bypassed. If the website blocks the download, save the file in Safari/Files first, then import it here.</p>`;
   $('#tryDirectAudioImport').onclick = () => { void fetchDirectAudioForImport(source); };
   $('#chooseDirectDownloadedAudio').onclick = () => chooseDownloadedLinkAudio(source);
+  $('#openDirectSource').onclick = () => { const opened = window.open(source.url, '_blank', 'noopener,noreferrer'); if (!opened) toast('Open the link in Safari, then save the file to Files'); };
   showSheet();
 }
 function chooseDownloadedLinkAudio(source = null) {
@@ -1678,37 +1770,104 @@ async function prepareLinkImportFile(file, source = linkImportContext) {
   try {
     showProgress('Preparing…', 'Reading audio details');
     const [metadata, embeddedLyrics, artwork] = await Promise.all([metadataFor(file), extractEmbeddedLyrics(file), extractMp3Artwork(file)]);
-    linkImportDraft = { file, source: source ? { ...source } : null, metadata, embeddedLyrics, artwork, duplicate: findPossibleDuplicate(file, metadata, source), previewUrl: artwork ? URL.createObjectURL(artwork) : '' };
+    metadata.title = cleanImportTitle(metadata.title || file.name);
+    if (pendingLinkImport?.sourceUrl && pendingLinkImport.sourceUrl === source?.url) { pendingLinkImport.titleSuggestion = metadata.title; pendingLinkImport.updatedAt = Date.now(); await saveRecord('settings', pendingLinkImport); }
+    linkImportDraft = { file, source: source ? { ...source } : null, metadata, embeddedLyrics, artwork, duplicate: findPossibleDuplicate(file, metadata, source), previewUrl: artwork ? URL.createObjectURL(artwork) : '', artworkKind: artwork ? 'embedded artwork' : 'Zombie placeholder' };
     hideProgress(); openLinkImportReview();
   } catch {
     hideProgress(); toast('Import failed. Try choosing the downloaded audio again.');
   }
 }
+function rememberDraftFields() {
+  if (!linkImportDraft) return;
+  const title = $('#linkDraftTitle'), artist = $('#linkDraftArtist'), album = $('#linkDraftAlbum');
+  if (title) linkImportDraft.metadata.title = title.value;
+  if (artist) linkImportDraft.metadata.artist = artist.value;
+  if (album) linkImportDraft.metadata.album = album.value;
+}
+function setLinkImportArtwork(artwork, kind = 'custom artwork') {
+  const draft = linkImportDraft; if (!draft) return;
+  if (draft.previewUrl) URL.revokeObjectURL(draft.previewUrl);
+  draft.artwork = artwork || null; draft.previewUrl = artwork ? URL.createObjectURL(artwork) : ''; draft.artworkKind = artwork ? kind : 'Zombie placeholder';
+}
+async function cropSquareArtwork(blob) {
+  const url = URL.createObjectURL(blob);
+  try {
+    const image = new Image(); image.decoding = 'async'; image.src = url;
+    await new Promise((resolve, reject) => { image.onload = resolve; image.onerror = reject; });
+    const size = Math.min(image.naturalWidth || image.width, image.naturalHeight || image.height);
+    if (!size) throw new Error('image');
+    const canvas = document.createElement('canvas'); canvas.width = 512; canvas.height = 512;
+    canvas.getContext('2d').drawImage(image, ((image.naturalWidth || image.width) - size) / 2, ((image.naturalHeight || image.height) - size) / 2, size, size, 0, 0, 512, 512);
+    return await new Promise((resolve, reject) => canvas.toBlob((output) => output ? resolve(output) : reject(new Error('image')), 'image/jpeg', .9));
+  } finally { URL.revokeObjectURL(url); }
+}
+async function useYouTubeThumbnailForDraft() {
+  const draft = linkImportDraft, videoId = draft?.source?.videoId;
+  if (!draft || !videoId) return;
+  rememberDraftFields();
+  try {
+    showProgress('Loading artwork…', 'Getting the video thumbnail');
+    const response = await fetch(`https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/hqdefault.jpg`, { mode: 'cors', credentials: 'omit' });
+    if (!response.ok) throw new Error('thumbnail');
+    const type = response.headers.get('content-type') || '';
+    if (!/^image\//i.test(type)) throw new Error('thumbnail');
+    setLinkImportArtwork(await cropSquareArtwork(await response.blob()), 'video thumbnail');
+    toast('Video thumbnail ready');
+  } catch { toast('That thumbnail is unavailable. Your audio can still import normally.'); }
+  finally { hideProgress(); openLinkImportReview(); }
+}
+async function useCustomLinkArtwork(file) {
+  if (!file || !/^image\//i.test(file.type || '')) { toast('Choose an image for artwork'); return; }
+  rememberDraftFields();
+  try { showProgress('Preparing artwork…', file.name); setLinkImportArtwork(await cropSquareArtwork(file), 'custom artwork'); }
+  catch { toast('Zombie could not use that image'); }
+  finally { hideProgress(); openLinkImportReview(); }
+}
 function openLinkImportReview() {
   const draft = linkImportDraft; if (!draft) return;
   const sourceText = draft.source ? `Source: ${draft.source.label}` : 'Downloaded audio file';
   $('#sheetTitle').textContent = 'Review import';
-  $('#sheetContent').innerHTML = `<section class="link-review-head"><div id="linkImportArt" class="link-import-art">${draft.artwork ? '' : '♫'}</div><span><strong>${escapeHTML(draft.file.name)}</strong><small>${sourceText} · ${formatBytes(draft.file.size)}</small></span></section>${draft.duplicate ? '<p class="duplicate-import-note">ⓘ This song may already be in your library. You can cancel or import it anyway.</p>' : ''}<label class="edit-field">Title<input id="linkDraftTitle" value="${escapeHTML(draft.metadata.title)}"></label><label class="edit-field">Artist<input id="linkDraftArtist" value="${escapeHTML(draft.metadata.artist)}"></label><label class="edit-field">Album<input id="linkDraftAlbum" value="${escapeHTML(draft.metadata.album || 'Single')}"></label><button id="cancelLinkImport" class="sheet-option">Cancel</button><button id="saveLinkImport" class="link-import-continue">${draft.duplicate ? 'Import Anyway' : 'Add to Library'}</button>`;
+  $('#sheetContent').innerHTML = `${importSteps('import')}<section class="link-review-head"><div id="linkImportArt" class="link-import-art">${draft.artwork ? '' : '♫'}</div><span><strong>${escapeHTML(cleanImportTitle(draft.file.name))}</strong><small>${sourceText} · ${formatBytes(draft.file.size)}</small></span></section>${draft.duplicate ? `<p class="duplicate-import-note">ⓘ This looks like “${escapeHTML(draft.duplicate.title)}” already in your library. You can view it, cancel, or import anyway.</p><button id="viewExistingLinkDuplicate" class="sheet-option">View Existing</button>` : ''}<div class="link-art-actions"><button id="usePlaceholderLinkArt" class="sheet-option">${draft.artwork ? 'Use Zombie placeholder' : '✓ Using Zombie placeholder'}</button>${draft.source?.kind === 'youtube' && draft.source.videoId ? '<button id="useVideoThumbnail" class="sheet-option">Use video thumbnail</button>' : ''}<button id="chooseLinkArtwork" class="sheet-option">Choose custom artwork</button><small>Artwork: ${escapeHTML(draft.artworkKind || 'Zombie placeholder')}</small></div><label class="edit-field">Title<input id="linkDraftTitle" value="${escapeHTML(draft.metadata.title)}"></label><label class="edit-field">Artist<input id="linkDraftArtist" value="${escapeHTML(draft.metadata.artist)}"></label><label class="edit-field">Album<input id="linkDraftAlbum" value="${escapeHTML(draft.metadata.album || 'Single')}"></label><section class="link-source-details"><strong>Import details</strong><small>${draft.source ? `${escapeHTML(draft.source.label)} source · ${escapeHTML(draft.source.originalUrl || draft.source.url)}` : 'File selected from this device'}<br>File: ${escapeHTML(draft.file.name)}</small></section><button id="cancelLinkImport" class="sheet-option">Cancel</button><button id="saveLinkImport" class="link-import-continue">${draft.duplicate ? 'Import Anyway' : 'Add to Library'}</button><p id="linkImportSaveError" class="link-import-feedback error" role="status"></p>`;
   if (draft.previewUrl) $('#linkImportArt').style.backgroundImage = `url("${draft.previewUrl}")`;
-  $('#cancelLinkImport').onclick = () => { clearLinkImportDraft(); closeSheet(); toast('Import cancelled'); };
+  $('#viewExistingLinkDuplicate')?.addEventListener('click', () => { const duplicateId = draft.duplicate.id; clearLinkImportDraft(); openSongDetails(duplicateId); });
+  $('#usePlaceholderLinkArt').onclick = () => { rememberDraftFields(); setLinkImportArtwork(null); openLinkImportReview(); };
+  $('#useVideoThumbnail')?.addEventListener('click', () => { void useYouTubeThumbnailForDraft(); });
+  $('#chooseLinkArtwork').onclick = () => { rememberDraftFields(); $('#linkArtworkInput').click(); };
+  $('#cancelLinkImport').onclick = async () => { clearLinkImportDraft(); await clearPendingImport(); closeSheet(); toast('Import cancelled'); };
   $('#saveLinkImport').onclick = () => { void saveLinkImportDraft(); };
   showSheet();
 }
 async function saveLinkImportDraft() {
-  const draft = linkImportDraft; if (!draft) return;
+  const draft = linkImportDraft; if (!draft || linkImportSaving) return;
+  linkImportSaving = true;
   try {
     const title = $('#linkDraftTitle').value.trim() || 'Untitled song', artist = neutralArtist($('#linkDraftArtist').value), album = $('#linkDraftAlbum').value.trim() || 'Single';
     const file = draft.file, fingerprint = `${file.name}|${file.size}|${file.lastModified}`;
+    const saveButton = $('#saveLinkImport'); if (saveButton) { saveButton.disabled = true; saveButton.textContent = 'Saving…'; }
     showProgress('Importing audio…', title);
     const track = { id: crypto.randomUUID(), ...draft.metadata, title, artist, album, fileName: file.name, type: file.type || 'audio/mpeg', size: file.size, fingerprint, emoji: randomEmoji(), isFavorite: false, genre: '', lyrics: draft.embeddedLyrics?.lyrics || '', syncedLyrics: draft.embeddedLyrics?.syncedLyrics || [], playCount: 0, addedAt: Date.now(), blobStored: true };
     if (draft.source?.url) { track.sourceUrl = draft.source.url; track.sourceName = draft.source.label; }
     await saveTrack(track, file); tracks.unshift(track);
     showProgress('Saving offline…', 'Adding it to your local library');
     if (draft.artwork) { try { track.artworkId = `track:${track.id}`; await saveArtwork(track.artworkId, draft.artwork); await saveRecord('tracks', track); } catch { delete track.artworkId; /* Audio remains safely imported if optional artwork cannot be stored. */ } }
-    clearLinkImportDraft(); render(); await refreshStorageStatus(); closeSheet(); toast('Audio added to Library');
+    clearLinkImportDraft(); await clearPendingImport(); currentView = 'songs'; collectionFilter = null; activePlaylistId = null; render(); await refreshStorageStatus(); openLinkImportSuccess(track); toast('Added to Zombie ✓');
   } catch (error) {
-    const quota = error?.name === 'QuotaExceededError'; toast(quota ? 'Not enough iPhone storage to save that music' : 'Import failed. Try downloading the audio file first, then choose Import Downloaded Audio.');
-  } finally { hideProgress(); }
+    const quota = error?.name === 'QuotaExceededError'; const message = quota ? 'Not enough iPhone storage to save that music' : 'Import failed. Check the downloaded audio, then try again.';
+    const errorNote = $('#linkImportSaveError'); if (errorNote) errorNote.textContent = message;
+    const saveButton = $('#saveLinkImport'); if (saveButton) { saveButton.disabled = false; saveButton.textContent = draft.duplicate ? 'Import Anyway' : 'Add to Library'; }
+    toast(message);
+  } finally { linkImportSaving = false; hideProgress(); }
+}
+function openLinkImportSuccess(track) {
+  currentView = 'songs'; collectionFilter = null; activePlaylistId = null;
+  $('#sheetTitle').textContent = 'Added to Zombie ✓';
+  $('#sheetContent').innerHTML = `${importSteps('done')}<section class="link-import-intro"><i>✓</i><span><strong>${escapeHTML(track.title)}</strong><small>Saved in your local library for offline playback.</small></span></section><button id="playImportedTrack" class="link-import-continue">Play now</button><button id="favoriteImportedTrack" class="sheet-option">♡ Add to Favorites</button><button id="playlistImportedTrack" class="sheet-option">Add to Playlist</button><button id="doneImportSuccess" class="sheet-option">Done</button>`;
+  $('#playImportedTrack').onclick = () => { closeSheet(); void playTrack(track.id, tracks.map((entry) => entry.id)); };
+  $('#favoriteImportedTrack').onclick = async () => { if (!track.isFavorite) await toggleFavorite(track.id); $('#favoriteImportedTrack').textContent = '♥ Added to Favorites'; };
+  $('#playlistImportedTrack').onclick = () => openPlaylistSheet(track.id);
+  $('#doneImportSuccess').onclick = closeSheet;
+  showSheet();
 }
 
 async function toggleFavorite(id) {
@@ -1875,7 +2034,7 @@ function openSongDetails(id) {
   const track = tracks.find((entry) => entry.id === id); if (!track) return;
   $('#sheetTitle').textContent = 'Song information';
   const fileType = (track.type || track.fileName?.split('.').pop() || 'Audio').replace(/^audio\//i, '').toUpperCase();
-  $('#sheetContent').innerHTML = `<dl class="song-details"><dt>Title</dt><dd>${escapeHTML(track.title)}</dd><dt>Artist</dt><dd>${escapeHTML(track.artist)}</dd><dt>Album</dt><dd>${escapeHTML(track.album)}</dd><dt>Genre</dt><dd>${escapeHTML(track.genre || 'Not set')}</dd>${track.sourceName ? `<dt>Source</dt><dd>${escapeHTML(track.sourceName)}</dd>` : ''}<dt>Duration</dt><dd>${formatTime(track.duration)}</dd><dt>Added</dt><dd>${new Date(track.addedAt).toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'})}</dd><dt>Last played</dt><dd>${track.lastPlayed ? new Date(track.lastPlayed).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'}) : 'Not played yet'}</dd><dt>Plays</dt><dd>${track.playCount || 0}</dd><dt>File</dt><dd>${escapeHTML(track.fileName || track.title)}</dd><dt>Type</dt><dd>${escapeHTML(fileType)}</dd><dt>Size</dt><dd>${formatBytes(track.size || 0)}</dd>${track.note ? `<dt>Note</dt><dd>${escapeHTML(track.note)}</dd>` : ''}</dl>${track.sourceUrl ? '<button class="sheet-option" id="openOriginalSource">Open original link</button>' : ''}<button class="sheet-option" id="editFromDetails">Edit song</button>`;
+  $('#sheetContent').innerHTML = `<dl class="song-details"><dt>Title</dt><dd>${escapeHTML(track.title)}</dd><dt>Artist</dt><dd>${escapeHTML(track.artist)}</dd><dt>Album</dt><dd>${escapeHTML(track.album)}</dd><dt>Genre</dt><dd>${escapeHTML(track.genre || 'Not set')}</dd>${track.sourceName ? `<dt>Source</dt><dd><span class="source-badge">Imported from ${escapeHTML(track.sourceName)}</span></dd>` : ''}<dt>Duration</dt><dd>${formatTime(track.duration)}</dd><dt>Added</dt><dd>${new Date(track.addedAt).toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'})}</dd><dt>Last played</dt><dd>${track.lastPlayed ? new Date(track.lastPlayed).toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric'}) : 'Not played yet'}</dd><dt>Plays</dt><dd>${track.playCount || 0}</dd><dt>File</dt><dd>${escapeHTML(track.fileName || track.title)}</dd><dt>Type</dt><dd>${escapeHTML(fileType)}</dd><dt>Size</dt><dd>${formatBytes(track.size || 0)}</dd>${track.note ? `<dt>Note</dt><dd>${escapeHTML(track.note)}</dd>` : ''}</dl>${track.sourceUrl ? '<button class="sheet-option" id="openOriginalSource">Open original link</button>' : ''}<button class="sheet-option" id="editFromDetails">Edit song</button>`;
   $('#openOriginalSource')?.addEventListener('click', () => { const opened = window.open(track.sourceUrl, '_blank', 'noopener,noreferrer'); if (!opened) toast('Open the original link in Safari'); });
   $('#editFromDetails').onclick = () => openSongEditor(id); showSheet();
 }
@@ -1937,6 +2096,7 @@ function wireUI() {
   $('#importButton').onclick = openAddMusicMenu; $('#chooseFiles').onclick = () => $('#fileInput').click();
   $('#fileInput').onchange = (event) => { importFiles(event.target.files); event.target.value = ''; };
   $('#linkFileInput').onchange = (event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void prepareLinkImportFile(file, linkImportContext); };
+  $('#linkArtworkInput').onchange = (event) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void useCustomLinkArtwork(file); };
   $('#artInput').onchange = (event) => { saveSelectedArtwork(event.target.files?.[0]); event.target.value = ''; };
   $('#lyricsInput').onchange = (event) => { importLyricsFile(event.target.files?.[0]); event.target.value = ''; };
   $('#visualInput').onchange = (event) => { saveSelectedVisual(event.target.files?.[0]); event.target.value = ''; };
@@ -2015,8 +2175,8 @@ function wireUI() {
 }
 async function initialise() {
   try {
-    installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.1').catch(() => {});
+    installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus();
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.2').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
