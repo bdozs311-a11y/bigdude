@@ -910,6 +910,10 @@ function hasLivePausedSource(track) {
   const snapshotMatches = !pausedResumeSnapshot || pausedResumeSnapshot.id !== track?.id || !pausedResumeSnapshot.src || pausedResumeSnapshot.src === source;
   return Boolean(source && snapshotMatches && !audio.error);
 }
+function hasLiveCurrentSource(track) {
+  const source = currentAudioSource();
+  return Boolean(track && currentId === track.id && currentUrl && source && !audio.error && (source === currentUrl || audio.src === currentUrl));
+}
 function replayVisualClass(element, className) {
   if (!element) return;
   element.classList.remove(className);
@@ -1065,7 +1069,8 @@ async function resumeCurrentAudio(reason = 'resume') {
     return recovered;
   }
   try {
-    // This is deliberately the direct fast path for the iPhone Lock Screen action: no UI/render work occurs before play().
+    // This is the normal in-app resume path. The lock-screen handler has its own
+    // deliberately synchronous fast path below.
     const started = await requestAudioPlay(track, loadToken, reason);
     const confirmed = started && confirmActualPlayback(track, loadToken, reason);
     if (confirmed) pausedResumeSnapshot = null;
@@ -1077,6 +1082,78 @@ async function resumeCurrentAudio(reason = 'resume') {
     toast('Zombie could not resume this song');
     return false;
   }
+}
+function keepLockScreenResumePaused(track, reason, details = {}) {
+  // A rejected or unconfirmed resume must not leave the app advertising playback.
+  // pause() preserves the existing source and position; it never rebuilds the song.
+  if (!audio.paused) audio.pause();
+  setMediaPlaybackState('paused');
+  reflectPausedPlayback(reason);
+  playbackDebug('lock-screen-play-kept-paused', { next: trackDebug(track), ...details });
+}
+function attemptLockScreenSourceRecovery(track, reason) {
+  // This is intentionally a fallback only. Normal Lock Screen resume never gets
+  // here because it uses the already-attached persistent audio source directly.
+  playbackDebug('lock-screen-play-fallback-restoration-attempt', { next: trackDebug(track), reason });
+  void rebuildPausedSource(track, reason).then((recovered) => {
+    playbackDebug('lock-screen-play-fallback-restoration-result', { next: trackDebug(track), reason, recovered });
+    if (!recovered) keepLockScreenResumePaused(track, `${reason}-failed`);
+  });
+}
+function resumeFromMediaSession() {
+  const track = tracks.find((entry) => entry.id === currentId);
+  const source = currentAudioSource();
+  const sourceAlive = hasLiveCurrentSource(track);
+  const startTime = audio.currentTime || 0;
+  playbackDebug('lock-screen-play-received', {
+    next: trackDebug(track), pausedBeforePlay: audio.paused, currentTimeBeforePlay: startTime,
+    sourceStatus: source ? 'attached' : 'missing', sourceAlive,
+  });
+  if (!track) { setMediaPlaybackState('paused'); return; }
+  if (!sourceAlive) {
+    attemptLockScreenSourceRecovery(track, 'media-session-play-missing-source');
+    return;
+  }
+
+  const token = loadToken;
+  let playPromise;
+  try {
+    // Keep this call synchronous and first: on iPhone, a Media Session command can
+    // arrive while the Home Screen app is throttled. No IndexedDB, queue, UI, or
+    // source work runs before the live audio element receives play().
+    playPromise = audio.play();
+  } catch (error) {
+    playbackDebug('lock-screen-play-rejected', { next: trackDebug(track), playError: { name: error?.name || 'Error', message: error?.message || String(error) } });
+    keepLockScreenResumePaused(track, 'media-session-play-threw');
+    return;
+  }
+  void Promise.resolve(playPromise).then(() => {
+    if (token !== loadToken) { playbackDebug('lock-screen-play-resolved-stale', { next: trackDebug(track) }); return; }
+    if (audio.paused || !currentAudioSource() || audio.error) {
+      const error = new Error('audio.play() resolved without an active playable source');
+      error.name = 'AudioStartVerificationError';
+      playbackDebug('lock-screen-play-unconfirmed', { next: trackDebug(track), playError: { name: error.name, message: error.message } });
+      const needsRecovery = Boolean(audio.error) || !currentAudioSource();
+      keepLockScreenResumePaused(track, 'media-session-play-unconfirmed');
+      if (needsRecovery) attemptLockScreenSourceRecovery(track, 'media-session-play-unconfirmed-source');
+      return;
+    }
+    playbackEpoch += 1;
+    playbackDebug('lock-screen-play-resolved', { next: trackDebug(track), startTime });
+    schedulePlaybackDiagnostic(track, token, 'media-session-play-direct', startTime);
+    if (!confirmActualPlayback(track, token, 'media-session-play-direct')) {
+      const needsRecovery = Boolean(audio.error) || !currentAudioSource();
+      keepLockScreenResumePaused(track, 'media-session-play-confirmation-failed');
+      if (needsRecovery) attemptLockScreenSourceRecovery(track, 'media-session-play-confirmation-source');
+      return;
+    }
+    pausedResumeSnapshot = null;
+  }).catch((error) => {
+    playbackDebug('lock-screen-play-rejected', { next: trackDebug(track), playError: { name: error?.name || 'Error', message: error?.message || String(error) } });
+    const needsRecovery = Boolean(audio.error) || !currentAudioSource();
+    keepLockScreenResumePaused(track, 'media-session-play-rejected');
+    if (needsRecovery) attemptLockScreenSourceRecovery(track, 'media-session-play-rejected-source');
+  });
 }
 async function updateMediaSession(track = tracks.find((entry) => entry.id === currentId)) {
   if (!track || !('mediaSession' in navigator) || !window.MediaMetadata) return;
@@ -1092,10 +1169,13 @@ function configureMediaSession() {
   if (!('mediaSession' in navigator)) return;
   const actions = {
     play: () => {
-      const track = tracks.find((entry) => entry.id === (pendingAudio?.id || currentId));
-      playbackDebug('media-session-play-handler-fired', { next: trackDebug(track), sourceAlive: hasLivePausedSource(track), pausedSnapshot: pausedResumeSnapshot?.id === track?.id ? { position: pausedResumeSnapshot.position, sameSource: pausedResumeSnapshot.src === currentAudioSource() } : null });
-      void resumeCurrentAudio('media-session-play');
-    }, pause: () => { playbackDebug('media-session-pause-handler-fired'); audio.pause(); },
+      resumeFromMediaSession();
+    }, pause: () => {
+      const track = tracks.find((entry) => entry.id === currentId);
+      playbackDebug('lock-screen-pause-received', { next: trackDebug(track), currentTimeBeforePause: audio.currentTime || 0, sourceStatus: currentAudioSource() ? 'attached' : 'missing' });
+      audio.pause();
+      if (audio.paused) setMediaPlaybackState('paused');
+    },
     previoustrack: () => { void previousTrack().catch((error) => playbackDebug('media-previous-failed', { actionError: error?.message || String(error) })); },
     nexttrack: () => { void nextTrack().catch((error) => playbackDebug('media-next-failed', { actionError: error?.message || String(error) })); },
   };
@@ -2603,6 +2683,7 @@ function wireUI() {
   audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); updateMediaPosition(); updateSyncedLyrics(); savePlayerState(); };
   audio.onloadedmetadata = () => { updateTimeDisplay(); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
   audio.onplay = () => { if (audioGraph?.context?.state === 'suspended') void audioGraph.context.resume().catch(() => {}); syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
+  audio.onplaying = () => { const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('playing-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); };
   audio.onpause = () => { syncAmbientMotionState(); capturePausedResumeSnapshot('audio-pause-event'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; animatePlaybackControls('paused'); setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
   audio.onended = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
   audio.onerror = () => { const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); $('#miniPlayer').classList.remove('loading'); setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); };
@@ -2646,7 +2727,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.6').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.7').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
