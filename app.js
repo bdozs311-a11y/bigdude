@@ -1733,8 +1733,10 @@ function openLinkImporter(value = linkImportContext?.url || pendingLinkImport?.s
   showSheet();
 }
 function copyLinkForConverter(source) {
-  if (!navigator.clipboard?.writeText) return Promise.reject(new Error('unavailable'));
-  return navigator.clipboard.writeText(source.url);
+  try {
+    if (!navigator.clipboard?.writeText) return Promise.reject(new Error('unavailable'));
+    return Promise.resolve(navigator.clipboard.writeText(source.url));
+  } catch { return Promise.reject(new Error('unavailable')); }
 }
 function openConverterFallback(source) {
   $('#sheetTitle').textContent = 'Converter could not open';
