@@ -434,7 +434,7 @@ function lyricsStatusLabel(track) {
   if (status === 'queued') return 'Lyrics waiting…';
   if (status === 'searching') return 'Finding lyrics…';
   if (status === 'synced') return 'Synced lyrics ✓';
-  if (status === 'plain') return 'Lyrics added ✓';
+  if (status === 'plain') return 'Plain lyrics added ✓';
   if (status === 'offline') return 'Offline — lyrics skipped';
   if (status === 'unavailable') return 'Lyrics search unavailable';
   if (status === 'not-found') return 'Lyrics not found';
@@ -539,7 +539,7 @@ async function runAutomaticLyricsSearch(trackId, { notify = false } = {}) {
     const best = matches.find((candidate) => candidate.confident);
     if (!best || hasStoredLyrics(track)) { await updateLyricsLookup(track, 'not-found'); if (notify) toast('Lyrics not found'); return; }
     const saved = await applyLyricsCandidate(track, best);
-    if (saved && notify) toast(best.syncedLyrics.length ? 'Synced lyrics added ✓' : 'Lyrics added ✓');
+    if (saved && notify) toast(best.syncedLyrics.length ? 'Synced lyrics added ✓' : 'Plain lyrics added ✓');
   } catch (error) {
     const status = lyricLookupFailureStatus(error); await updateLyricsLookup(track, status);
     if (notify) toast(status === 'offline' ? 'Offline — lyrics search skipped' : 'Lyrics search unavailable');
@@ -654,9 +654,11 @@ function closeLyrics() { lyricsSyncDraft = null; setLyricsScreenMode(false); con
 function openLyricsMenu() {
   const track = tracks.find((entry) => entry.id === activeLyricsId); if (!track) return;
   $('#sheetTitle').textContent = 'Lyrics';
-  const finderLabel = hasStoredLyrics(track) ? 'Find / Replace Lyrics' : track.lyricsLookup?.status === 'not-found' ? 'Retry Lyrics Search' : 'Find Lyrics';
-  $('#sheetContent').innerHTML = `<button id="fixLyricsSync" class="lyrics-main-action">Fix Sync</button><button id="findLyricsFromScreen" class="sheet-option">⌕ ${finderLabel}</button><button class="sheet-option" id="quickLyricsEditor">Edit Lyrics</button><details class="lyrics-advanced"><summary>Advanced Sync Settings</summary><p>Fine-tune timing, edit individual lines, or import lyrics. These tools are hidden during normal playback.</p><button class="sheet-option" id="advancedLyricsOffset">Adjust all lyric timing</button>${track.syncedLyrics?.length ? '<button class="sheet-option" id="advancedLineEditor">Edit timestamps and lyric text</button>' : ''}<button class="sheet-option" id="advancedLyricsEditor">Import or edit lyrics</button></details>`;
+  const finderLabel = hasStoredLyrics(track) ? 'Find / Replace Lyrics' : 'Find Lyrics';
+  const retryable = !hasStoredLyrics(track) && ['not-found', 'offline', 'unavailable'].includes(track.lyricsLookup?.status);
+  $('#sheetContent').innerHTML = `<button id="fixLyricsSync" class="lyrics-main-action">Fix Sync</button>${retryable ? '<button id="retryLyricsSearch" class="sheet-option">↻ Retry Lyrics Search</button>' : ''}<button id="findLyricsFromScreen" class="sheet-option">⌕ ${finderLabel}</button><button class="sheet-option" id="quickLyricsEditor">Edit Lyrics</button><details class="lyrics-advanced"><summary>Advanced Sync Settings</summary><p>Fine-tune timing, edit individual lines, or import lyrics. These tools are hidden during normal playback.</p><button class="sheet-option" id="advancedLyricsOffset">Adjust all lyric timing</button>${track.syncedLyrics?.length ? '<button class="sheet-option" id="advancedLineEditor">Edit timestamps and lyric text</button>' : ''}<button class="sheet-option" id="advancedLyricsEditor">Import or edit lyrics</button></details>`;
   $('#fixLyricsSync').onclick = () => { closeSheet(); startLyricsSync(); };
+  $('#retryLyricsSearch')?.addEventListener('click', () => { closeSheet(); queueAutomaticLyrics(track, { notify: true }); });
   $('#findLyricsFromScreen').onclick = () => { void openLyricsFinder(track.id); };
   $('#quickLyricsEditor').onclick = () => openLyricsEditor(track.id);
   $('#advancedLyricsOffset').onclick = openLyricsOffset;
@@ -2466,7 +2468,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.1').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.2').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
