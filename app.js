@@ -768,6 +768,22 @@ function commitPendingPlayback(reason) {
   savePlayerState(true); showMiniPlayer(track); render();
   return true;
 }
+function rollbackPendingPlayback(reason) {
+  const pending = pendingAudio;
+  if (!pending) return;
+  // A failed start must never leave the new source pretending to be the current song.
+  // Put the still-valid prior source back before the queue state is restored.
+  pendingAudio = null;
+  if (audio.src === pending.url || audio.currentSrc === pending.url) {
+    audio.pause();
+    if (currentUrl) audio.src = currentUrl;
+    else audio.removeAttribute('src');
+  }
+  pausedResumeSnapshot = null;
+  retireAudioUrl(pending.url, `failed transition ${reason}`);
+  releaseRetiredAudioUrls(`failed transition ${reason}`);
+  playbackDebug('transition-rolled-back', { reason, previous: pending.previous, next: trackDebug(tracks.find((entry) => entry.id === pending.id)) });
+}
 function schedulePlaybackDiagnostic(track, token, reason, startTime) {
   window.setTimeout(() => {
     if (token !== loadToken || currentId !== track.id) return;
@@ -788,12 +804,18 @@ function schedulePlaybackDiagnostic(track, token, reason, startTime) {
   }, 900);
 }
 function confirmActualPlayback(track, token, reason) {
-  if (token !== loadToken || audio.paused || !(audio.currentSrc || audio.src) || audio.readyState < 2) {
+  const source = currentAudioSource();
+  const pendingMatches = Boolean(pendingAudio && pendingAudio.id === track.id && pendingAudio.token === token && (audio.src === pendingAudio.url || audio.currentSrc === pendingAudio.url));
+  const currentMatches = currentId === track.id && Boolean(currentUrl) && (source === currentUrl || audio.src === currentUrl);
+  // audio.play() resolving is the browser's reliable "started" signal. Requiring a
+  // separate readyState threshold here could wrongly reject a real iPhone resume.
+  if (token !== loadToken || audio.paused || !source || (!pendingMatches && !currentMatches)) {
     playbackDebug('play-confirmation-failed', { reason, next: trackDebug(track) }); setMediaPlaybackState('paused'); return false;
   }
-  if (!commitPendingPlayback('play-confirmed')) {
+  if (pendingMatches && !commitPendingPlayback('play-confirmed')) {
     playbackDebug('play-confirmation-commit-failed', { reason, next: trackDebug(track) }); setMediaPlaybackState('paused'); return false;
   }
+  if (currentMatches) playbackDebug('play-confirmed-current-source', { reason, next: trackDebug(track) });
   const activeTrack = tracks.find((entry) => entry.id === currentId) || track;
   pausedResumeSnapshot = null;
   $('#miniPlayer').classList.remove('loading'); $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; animatePlaybackControls('playing'); setMediaPlaybackState('playing');
@@ -809,6 +831,9 @@ async function requestAudioPlay(track, token = loadToken, reason = 'play') {
     await audio.play();
     if (token !== loadToken) { playbackDebug('play-resolved-stale', { reason, next: trackDebug(track) }); return false; }
     if (audio.paused || !(audio.currentSrc || audio.src)) { const error = new Error('audio.play() resolved without an active playing source'); error.name = 'AudioStartVerificationError'; throw error; }
+    // This is intentionally updated from the play promise, not only the DOM event:
+    // iOS may delay DOM event delivery while a Home Screen app is backgrounded.
+    playbackEpoch += 1;
     playbackDebug('play-resolved', { reason, next: trackDebug(track), startTime }); schedulePlaybackDiagnostic(track, token, reason, startTime);
     return true;
   } catch (error) {
@@ -1174,11 +1199,11 @@ async function playTrack(id, sourceIds = null, options = {}) {
   } catch (error) {
     if (token === loadToken) {
       playbackDebug('transition-failed', { previous: trackDebug(previousTrack), next: trackDebug(track), transitionError: { name: error?.name || 'Error', message: error?.message || String(error) } });
-      // Keep the prepared Blob source available for a later manual retry, but never report a rejected start as playback success.
-      const prepared = commitPendingPlayback('play-rejected-prepared-source');
-      if (prepared) {
-        $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; syncAmbientMotionState(); render();
-      }
+      // Do not advance currentId, metadata, or the visible queue for a rejected play().
+      // Restoring the prior source also prevents a later resume from playing a different,
+      // invisible track through a stale Blob URL.
+      rollbackPendingPlayback('play-rejected');
+      $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; syncAmbientMotionState(); render();
       setMediaPlaybackState('paused'); toast("This audio file couldn't be played.");
       return false;
     }
@@ -1326,13 +1351,13 @@ async function nextTrack(fromEnd = false) {
   playbackDebug('next-track-resolved', { fromEnd, previous: trackDebug(previousTrack), next: trackDebug(tracks.find((entry) => entry.id === id)) });
   const started = await playTrack(id, null, { reason: fromEnd ? 'ended' : 'next' });
   if (!started) {
-    // A rejected next-song start may leave a valid, paused source ready for an explicit retry.
-    // Keep that source and its queue position rather than restoring a stale completed song.
+    // playTrack rolls the source back before returning false, so restore the exact queue
+    // snapshot too. This keeps a silent/failed candidate out of the saved session.
     if (currentId !== id) {
       queueIndex = previousQueueState.queueIndex; shuffleBag = previousQueueState.shuffleBag; shuffleHistory = previousQueueState.shuffleHistory; savePlayerState(true);
     }
     setMediaPlaybackState('paused');
-    playbackDebug('next-track-not-started', { fromEnd, previous: trackDebug(previousTrack), next: trackDebug(tracks.find((entry) => entry.id === id)), preparedPausedSource: currentId === id });
+    playbackDebug('next-track-not-started', { fromEnd, previous: trackDebug(previousTrack), next: trackDebug(tracks.find((entry) => entry.id === id)), queueRestored: currentId !== id });
   }
   return started;
 }
@@ -2197,7 +2222,7 @@ function wireUI() {
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
   audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); updateMediaPosition(); updateSyncedLyrics(); savePlayerState(); };
   audio.onloadedmetadata = () => { updateTimeDisplay(); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
-  audio.onplay = () => { if (audioGraph?.context?.state === 'suspended') void audioGraph.context.resume().catch(() => {}); playbackEpoch += 1; syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
+  audio.onplay = () => { if (audioGraph?.context?.state === 'suspended') void audioGraph.context.resume().catch(() => {}); syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
   audio.onpause = () => { syncAmbientMotionState(); capturePausedResumeSnapshot('audio-pause-event'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; animatePlaybackControls('paused'); setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
   audio.onended = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
   audio.onerror = () => { const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); $('#miniPlayer').classList.remove('loading'); setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); };
@@ -2241,7 +2266,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.3.1').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.3.2').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
