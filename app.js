@@ -7,7 +7,7 @@ const audio = $('#audio');
 let db;
 let tracks = [], playlists = [], playlistFolders = [];
 let currentId = null, currentUrl = null, loadToken = 0, playbackSerial = 0, countedSerial = -1;
-let endedTransitionInFlight = false, pendingAudio = null, preparedNext = null, preparedNextLoading = null, preloadToken = 0;
+let endedTransitionInFlight = false, pendingAudio = null, preparedNext = null, preparedNextLoading = null, preparedFollowing = null, preparedFollowingLoading = null, preloadToken = 0, followingPreloadToken = 0;
 let failedEndedTransition = null;
 let pausedResumeSnapshot = null, mediaResumeAttempt = 0;
 let playbackEpoch = 0, lastHandledEndedEpoch = -1, foregroundRecoveryToken = 0;
@@ -928,6 +928,8 @@ function playbackDebug(stage, details = {}) {
     error: audioErrorDebug(), mediaPlaybackState: navigator.mediaSession?.playbackState || null, visibility: document.visibilityState,
     transitionGeneration: loadToken, preparedNext: preparedNext?.track || null,
     preparedNextLoading: preparedNextLoading?.track || null,
+    preparedFollowing: preparedFollowing?.track || null,
+    preparedFollowingLoading: preparedFollowingLoading?.track || null,
     failedEndedTransition: failedEndedTransition ? { id: failedEndedTransition.id, previousId: failedEndedTransition.previousId, recovering: Boolean(failedEndedTransition.recovering) } : null,
     ...details,
   });
@@ -1398,6 +1400,15 @@ async function playTrack(id, sourceIds = null, options = {}) {
       if (token !== loadToken) return false;
       preloaded = preparedNext?.id === id ? preparedNext : null;
     }
+    if (!preloaded && promotePreparedFollowing(id)) preloaded = preparedNext?.id === id ? preparedNext : null;
+    if (!preloaded) preloaded = preparedNext?.id === id ? preparedNext : null;
+    if (!preloaded && preparedFollowingLoading?.id === id) {
+      playbackDebug('following-preload-awaiting', { previous: trackDebug(previousTrack), next: trackDebug(track) });
+      await preparedFollowingLoading.promise;
+      if (token !== loadToken) return false;
+      if (promotePreparedFollowing(id)) preloaded = preparedNext?.id === id ? preparedNext : null;
+      if (!preloaded) preloaded = preparedNext?.id === id ? preparedNext : null;
+    }
     let nextUrl;
     if (preloaded) {
       preparedNext = null; nextUrl = preloaded.url;
@@ -1528,24 +1539,94 @@ function setShuffleEnabled(enabled) {
   discardPreparedNext('shuffle-mode-changed'); saveQueueSession(); updatePlayerMode();
   toast(shuffleOn ? 'Shuffle on' : 'Shuffle off');
 }
-function nextQueueIdForPreload() {
-  if (!queue.length) return null;
-  if (shuffleOn) return shuffleBag[0] || null;
-  const nextIndex = queueIndex + 1;
-  if (nextIndex < queue.length) return queue[nextIndex];
-  return repeatMode === 'all' ? queue[0] : null;
+function upcomingQueueIdsForPreload(limit = 2) {
+  if (!queue.length || limit < 1) return [];
+  if (shuffleOn) return shuffleBag.slice(0, limit).filter((id, index, ids) => id && id !== currentId && ids.indexOf(id) === index);
+  const ids = [];
+  for (let step = 1; step <= limit; step += 1) {
+    let index = queueIndex + step;
+    if (index >= queue.length) {
+      if (repeatMode !== 'all') break;
+      index %= queue.length;
+    }
+    const id = queue[index];
+    if (id && id !== currentId && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+function nextQueueIdForPreload() { return upcomingQueueIdsForPreload(2)[0] || null; }
+function followingQueueIdForPreload() { return upcomingQueueIdsForPreload(2)[1] || null; }
+function discardPreparedFollowing(reason) {
+  const prepared = preparedFollowing, loading = preparedFollowingLoading;
+  preparedFollowing = null; preparedFollowingLoading = null; followingPreloadToken += 1;
+  if (prepared && prepared.url !== currentUrl && audio.src !== prepared.url && audio.currentSrc !== prepared.url) URL.revokeObjectURL(prepared.url);
+  if (prepared || loading) playbackDebug('following-preload-discarded', { reason, next: prepared?.track || loading?.track, loading: Boolean(loading) });
 }
 function discardPreparedNext(reason) {
   const prepared = preparedNext, loading = preparedNextLoading;
   preparedNext = null; preparedNextLoading = null; preloadToken += 1;
   if (prepared && prepared.url !== currentUrl && audio.src !== prepared.url && audio.currentSrc !== prepared.url) URL.revokeObjectURL(prepared.url);
+  discardPreparedFollowing(`${reason}:following`);
   if (prepared || loading) playbackDebug('next-preload-discarded', { reason, next: prepared?.track || loading?.track, loading: Boolean(loading) });
+}
+function promotePreparedFollowing(id) {
+  if (preparedFollowing?.id !== id) return false;
+  // A manual jump can promote the second cached source. Retire any different
+  // immediate candidate first so an older async preload cannot overwrite it later.
+  const staleNext = preparedNext, staleLoading = preparedNextLoading;
+  const hasDifferentNext = Boolean(staleNext && staleNext.id !== id) || Boolean(staleLoading && staleLoading.id !== id);
+  if (hasDifferentNext) {
+    preparedNext = null; preparedNextLoading = null; preloadToken += 1;
+    if (staleNext && staleNext.url !== currentUrl && audio.src !== staleNext.url && audio.currentSrc !== staleNext.url) URL.revokeObjectURL(staleNext.url);
+    if (staleNext || staleLoading) playbackDebug('next-preload-discarded-for-promotion', { next: staleNext?.track || staleLoading?.track });
+  }
+  preparedNext = preparedFollowing; preparedFollowing = null;
+  playbackDebug('following-preload-promoted', { next: preparedNext.track, blobLoaded: true, objectUrlCreated: true });
+  void prepareFollowingTrack();
+  return true;
+}
+async function prepareFollowingTrack() {
+  const id = followingQueueIdForPreload();
+  if (!id) { discardPreparedFollowing('no-following-track'); return false; }
+  if (preparedFollowing?.id === id) return true;
+  if (preparedFollowingLoading?.id === id) return preparedFollowingLoading.promise;
+  discardPreparedFollowing('following-track-changed');
+  const token = ++followingPreloadToken;
+  const track = tracks.find((entry) => entry.id === id); if (!track) return false;
+  const trackInfo = trackDebug(track);
+  playbackDebug('following-preload-start', { next: trackInfo });
+  const task = (async () => {
+    try {
+      const blob = await getAudioBlob(id);
+      if (token !== followingPreloadToken || id !== followingQueueIdForPreload()) return false;
+      if (!blob) { playbackDebug('following-preload-blob-missing', { next: trackInfo, blobLoaded: false }); return false; }
+      const url = URL.createObjectURL(blob);
+      if (token !== followingPreloadToken || id !== followingQueueIdForPreload()) { URL.revokeObjectURL(url); return false; }
+      preparedFollowing = { id, url, track: trackInfo, blobBytes: blob.size };
+      playbackDebug('following-preload-ready', { next: trackInfo, blobLoaded: true, objectUrlCreated: true, blobBytes: blob.size });
+      return true;
+    } catch (error) {
+      playbackDebug('following-preload-failed', { next: trackInfo, preloadError: { name: error?.name || 'Error', message: error?.message || String(error) } });
+      return false;
+    }
+  })();
+  preparedFollowingLoading = { id, token, track: trackInfo, promise: task };
+  try { return await task; }
+  finally { if (preparedFollowingLoading?.token === token) preparedFollowingLoading = null; }
 }
 async function prepareNextTrack() {
   const id = nextQueueIdForPreload();
-  if (!id || id === currentId) { discardPreparedNext('no-upcoming-track'); return false; }
-  if (preparedNext?.id === id) return true;
+  if (!id) { discardPreparedNext('no-upcoming-track'); return false; }
+  if (preparedNext?.id === id) { void prepareFollowingTrack(); return true; }
   if (preparedNextLoading?.id === id) return preparedNextLoading.promise;
+  if (promotePreparedFollowing(id)) return true;
+  if (preparedFollowingLoading?.id === id) {
+    playbackDebug('following-preload-awaiting-promotion', { next: preparedFollowingLoading.track });
+    await preparedFollowingLoading.promise;
+    if (id !== nextQueueIdForPreload()) return false;
+    if (preparedNext?.id === id) { void prepareFollowingTrack(); return true; }
+    if (promotePreparedFollowing(id)) return true;
+  }
   discardPreparedNext('upcoming-track-changed');
   const token = ++preloadToken;
   const track = tracks.find((entry) => entry.id === id); if (!track) return false;
@@ -1568,7 +1649,10 @@ async function prepareNextTrack() {
   })();
   preparedNextLoading = { id, token, track: trackInfo, promise: task };
   try { return await task; }
-  finally { if (preparedNextLoading?.token === token) preparedNextLoading = null; }
+  finally {
+    if (preparedNextLoading?.token === token) preparedNextLoading = null;
+    if (preparedNext?.id === nextQueueIdForPreload()) void prepareFollowingTrack();
+  }
 }
 async function nextTrack(fromEnd = false) {
   if (!queue.length) return;
@@ -2562,7 +2646,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.5').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.6').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
