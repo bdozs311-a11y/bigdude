@@ -1100,6 +1100,89 @@ function attemptLockScreenSourceRecovery(track, reason) {
     if (!recovered) keepLockScreenResumePaused(track, `${reason}-failed`);
   });
 }
+function restoreLockScreenResumePosition(position) {
+  if (!Number.isFinite(position) || position < 0) return;
+  try { audio.currentTime = Math.min(position, Math.max(0, (audio.duration || position) - 0.05)); } catch { /* metadata may not be available yet */ }
+}
+function handleLockScreenResumeFailure(track, token, position, reason, canRetry, details = {}) {
+  if (canRetry && token === loadToken && hasLiveCurrentSource(track)) {
+    retryLockScreenResume(track, token, position, reason);
+    return;
+  }
+  const sourceInvalid = Boolean(audio.error) || !currentAudioSource();
+  keepLockScreenResumePaused(track, reason, details);
+  if (sourceInvalid) attemptLockScreenSourceRecovery(track, `${reason}-invalid-source`);
+}
+function runLockScreenPlayAttempt(track, token, position, reason, canRetry) {
+  let settled = false;
+  let watchdog = null;
+  const cleanUp = () => {
+    if (watchdog) window.clearTimeout(watchdog);
+    audio.removeEventListener('playing', onPlaying);
+    audio.removeEventListener('error', onError);
+  };
+  const fail = (stage, details = {}) => {
+    if (settled) return;
+    settled = true; cleanUp();
+    playbackDebug(`lock-screen-play-${stage}`, { next: trackDebug(track), ...details });
+    handleLockScreenResumeFailure(track, token, position, `media-session-${stage}`, canRetry, details);
+  };
+  const confirm = () => {
+    if (settled) return;
+    if (token !== loadToken) { settled = true; cleanUp(); playbackDebug('lock-screen-play-resolved-stale', { next: trackDebug(track) }); return; }
+    if (audio.paused || !currentAudioSource() || audio.error) { fail('play-unconfirmed'); return; }
+    settled = true; cleanUp(); playbackEpoch += 1;
+    playbackDebug('lock-screen-play-confirmed', { next: trackDebug(track), reason, startTime: position });
+    schedulePlaybackDiagnostic(track, token, reason, position);
+    if (!confirmActualPlayback(track, token, reason)) handleLockScreenResumeFailure(track, token, position, 'media-session-play-confirmation-failed', canRetry);
+    else pausedResumeSnapshot = null;
+  };
+  const onPlaying = () => { playbackDebug('lock-screen-play-playing-event-received', { next: trackDebug(track), reason }); confirm(); };
+  const onError = () => fail('play-error-event', { mediaError: audioErrorDebug() });
+  audio.addEventListener('playing', onPlaying);
+  audio.addEventListener('error', onError, { once: true });
+  let playPromise;
+  try {
+    // This stays the first operation in the Media Session path: it uses the one
+    // persistent element and its already-attached source, with no queue or DB work.
+    playPromise = audio.play();
+  } catch (error) {
+    fail('play-threw', { playError: { name: error?.name || 'Error', message: error?.message || String(error) } });
+    return;
+  }
+  void Promise.resolve(playPromise).then(() => {
+    playbackDebug('lock-screen-play-resolved', { next: trackDebug(track), reason, startTime: position });
+    if (audio.paused || !currentAudioSource() || audio.error) { fail('play-unconfirmed'); return; }
+    if (!settled) watchdog = window.setTimeout(() => fail('playing-event-timeout'), 650);
+  }).catch((error) => fail('play-rejected', { playError: { name: error?.name || 'Error', message: error?.message || String(error) } }));
+}
+function retryLockScreenResume(track, token, position, reason) {
+  // Exactly one retry per lock-screen command. It never changes track/source/queue.
+  playbackDebug('lock-screen-play-retry-start', { next: trackDebug(track), reason, preservedPosition: position });
+  if (token !== loadToken || !hasLiveCurrentSource(track)) { handleLockScreenResumeFailure(track, token, position, 'media-session-retry-no-live-source', false); return; }
+  audio.pause();
+  const retryPlay = () => {
+    if (token !== loadToken || !hasLiveCurrentSource(track)) { handleLockScreenResumeFailure(track, token, position, 'media-session-retry-source-lost', false); return; }
+    restoreLockScreenResumePosition(position);
+    // Calling this directly after the optional wake-up retains the same audio element,
+    // current source, and exact queue/session state.
+    runLockScreenPlayAttempt(track, token, position, 'media-session-play-retry', false);
+  };
+  const futureData = audio.HAVE_FUTURE_DATA || 3;
+  const needsLoad = audio.readyState < futureData || audio.networkState === audio.NETWORK_LOADING;
+  if (!needsLoad) { retryPlay(); return; }
+  let metadataHandled = false;
+  const afterMetadata = () => {
+    if (metadataHandled) return;
+    metadataHandled = true;
+    audio.removeEventListener('canplay', afterMetadata);
+    retryPlay();
+  };
+  audio.addEventListener('loadedmetadata', afterMetadata, { once: true });
+  audio.addEventListener('canplay', afterMetadata, { once: true });
+  playbackDebug('lock-screen-play-retry-load-existing-source', { next: trackDebug(track), reason, needsLoad, preservedPosition: position });
+  audio.load();
+}
 function resumeFromMediaSession() {
   const track = tracks.find((entry) => entry.id === currentId);
   const source = currentAudioSource();
@@ -1115,45 +1198,7 @@ function resumeFromMediaSession() {
     return;
   }
 
-  const token = loadToken;
-  let playPromise;
-  try {
-    // Keep this call synchronous and first: on iPhone, a Media Session command can
-    // arrive while the Home Screen app is throttled. No IndexedDB, queue, UI, or
-    // source work runs before the live audio element receives play().
-    playPromise = audio.play();
-  } catch (error) {
-    playbackDebug('lock-screen-play-rejected', { next: trackDebug(track), playError: { name: error?.name || 'Error', message: error?.message || String(error) } });
-    keepLockScreenResumePaused(track, 'media-session-play-threw');
-    return;
-  }
-  void Promise.resolve(playPromise).then(() => {
-    if (token !== loadToken) { playbackDebug('lock-screen-play-resolved-stale', { next: trackDebug(track) }); return; }
-    if (audio.paused || !currentAudioSource() || audio.error) {
-      const error = new Error('audio.play() resolved without an active playable source');
-      error.name = 'AudioStartVerificationError';
-      playbackDebug('lock-screen-play-unconfirmed', { next: trackDebug(track), playError: { name: error.name, message: error.message } });
-      const needsRecovery = Boolean(audio.error) || !currentAudioSource();
-      keepLockScreenResumePaused(track, 'media-session-play-unconfirmed');
-      if (needsRecovery) attemptLockScreenSourceRecovery(track, 'media-session-play-unconfirmed-source');
-      return;
-    }
-    playbackEpoch += 1;
-    playbackDebug('lock-screen-play-resolved', { next: trackDebug(track), startTime });
-    schedulePlaybackDiagnostic(track, token, 'media-session-play-direct', startTime);
-    if (!confirmActualPlayback(track, token, 'media-session-play-direct')) {
-      const needsRecovery = Boolean(audio.error) || !currentAudioSource();
-      keepLockScreenResumePaused(track, 'media-session-play-confirmation-failed');
-      if (needsRecovery) attemptLockScreenSourceRecovery(track, 'media-session-play-confirmation-source');
-      return;
-    }
-    pausedResumeSnapshot = null;
-  }).catch((error) => {
-    playbackDebug('lock-screen-play-rejected', { next: trackDebug(track), playError: { name: error?.name || 'Error', message: error?.message || String(error) } });
-    const needsRecovery = Boolean(audio.error) || !currentAudioSource();
-    keepLockScreenResumePaused(track, 'media-session-play-rejected');
-    if (needsRecovery) attemptLockScreenSourceRecovery(track, 'media-session-play-rejected-source');
-  });
+  runLockScreenPlayAttempt(track, loadToken, startTime, 'media-session-play-direct', true);
 }
 async function updateMediaSession(track = tracks.find((entry) => entry.id === currentId)) {
   if (!track || !('mediaSession' in navigator) || !window.MediaMetadata) return;
@@ -2727,7 +2772,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.7').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.8').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
