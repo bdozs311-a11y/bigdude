@@ -479,9 +479,11 @@ function lyricsCandidateFor(track, record) {
   const durationDelta = details.duration && candidateDuration ? Math.abs(details.duration - candidateDuration) : null;
   const durationScore = durationDelta === null ? 0 : durationDelta <= 1.75 ? 24 : durationDelta <= 3.5 ? 20 : durationDelta <= 7 ? 10 : durationDelta <= 12 ? 2 : -26;
   const score = titleScore + artistScore + albumScore + durationScore + (syncedLyrics.length ? 8 : 1) + 4;
-  const confident = titleScore >= 31 && (details.artist
-    ? artistScore >= 18 && score >= (details.duration ? 70 : 66)
-    : titleScore >= 42 && (durationDelta === null || durationDelta <= 4) && score >= 65);
+  const titleExact = titleScore === 42, durationLooksRight = durationDelta === null || durationDelta <= 7;
+  const confident = (titleExact && (details.artist
+    ? artistScore >= 28 && durationLooksRight && score >= (details.duration ? 70 : 66)
+    : (durationDelta === null || durationDelta <= 4) && score >= 65))
+    || (!titleExact && titleScore >= 31 && details.artist && artistScore === 34 && durationDelta !== null && durationDelta <= 3.5 && score >= 88);
   return { id: record?.id, trackName: record?.trackName || record?.name || 'Untitled song', artistName: record?.artistName || 'Unknown artist', albumName: record?.albumName || 'Single', duration: candidateDuration, durationDelta, syncedLyrics, lyrics, score, titleScore, artistScore, confident };
 }
 const LyricsProvider = {
@@ -2464,7 +2466,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.1').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
