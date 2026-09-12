@@ -11,6 +11,7 @@ let endedTransitionInFlight = false, pendingAudio = null, preparedNext = null, p
 let failedEndedTransition = null;
 let pausedResumeSnapshot = null, mediaResumeAttempt = 0;
 let playbackEpoch = 0, lastHandledEndedEpoch = -1, foregroundRecoveryToken = 0;
+let backgroundStallWatchdog = null, lastBackgroundStallRecoveryAt = 0, restoredPlaybackState = 'paused';
 const retiredAudioUrls = new Set();
 let currentView = 'songs', collectionFilter = null, activePlaylistId = null;
 // One view-independent playback context. Library shelves only choose the initial
@@ -234,8 +235,8 @@ function saveRecord(name, record) {
 }
 function savePlayerState(force = false) {
   if (!db) return;
-  const now = Date.now(); if (!force && now - lastStateSaveAt < 3500) return; lastStateSaveAt = now;
-  const state = { key: 'playerState', currentId, queue, queueIndex, activeQueueSource, shuffleOn, shuffleBag, shuffleHistory, repeatMode, volume: audio.volume, position: Number.isFinite(audio.currentTime) ? audio.currentTime : restoredPosition };
+  const now = Date.now(); if (!force && now - lastStateSaveAt < 2500) return; lastStateSaveAt = now;
+  const state = { key: 'playerState', currentId, queue, queueIndex, activeQueueSource, shuffleOn, shuffleBag, shuffleHistory, repeatMode, volume: audio.volume, position: Number.isFinite(audio.currentTime) ? audio.currentTime : restoredPosition, playbackState: audio.paused ? 'paused' : 'playing', savedAt: now };
   saveRecord('settings', state).catch(() => {});
 }
 async function restorePlayerState() {
@@ -251,6 +252,7 @@ async function restorePlayerState() {
   shuffleHistory = Array.isArray(state.shuffleHistory) ? state.shuffleHistory.filter((id) => queue.includes(id)) : [];
   reconcileShuffleState('restore');
   restoredPosition = Number.isFinite(state.position) && state.position > 0 ? state.position : 0;
+  restoredPlaybackState = state.playbackState === 'playing' ? 'playing' : 'paused';
   audio.volume = Number.isFinite(state.volume) ? Math.min(1, Math.max(0, state.volume)) : 1;
 }
 function applyPreferences() {
@@ -396,6 +398,13 @@ async function syncNowPlayingVisual(track = tracks.find((entry) => entry.id === 
     if (token !== visualLoadToken || !canUseAnimatedVisual(track) || !record?.blob) return;
     let url = visualUrls.get(track.visualId);
     if (!url) { url = URL.createObjectURL(record.blob); visualUrls.set(track.visualId, url); }
+    // A local visual is purely decorative. Its failure must immediately reveal the
+    // static artwork and can never interact with the persistent music element.
+    visual.onerror = () => {
+      if (token !== visualLoadToken) return;
+      console.info('[Zombie visual] local visual load failed; using static artwork');
+      stopNowPlayingVisual();
+    };
     visual.src = url; stage?.classList.remove('visual-active'); visual.classList.remove('hidden'); requestAnimationFrame(() => { visual.classList.add('active'); stage?.classList.add('visual-active'); });
     await visual.play();
   } catch (error) {
@@ -622,6 +631,15 @@ function renderLyrics(track = tracks.find((entry) => entry.id === activeLyricsId
   $('#lyricsTrackTitle').textContent = `${track.emoji} ${track.title}`; $('#lyricsTrackArtist').textContent = `${track.artist} · ${track.album || 'Single'}`;
   if (track.syncedLyrics?.length) {
     content.innerHTML = track.syncedLyrics.map((line, index) => `<button class="lyric-line lyric-future" data-lyric-index="${index}" data-lyric-time="${line.time}">${escapeHTML(line.text)}</button>`).join('');
+    content.querySelectorAll('[data-lyric-time]').forEach((line) => {
+      line.onclick = () => {
+        const lyricTime = Number(line.dataset.lyricTime);
+        if (!Number.isFinite(lyricTime)) return;
+        const target = Math.max(0, lyricTime + lyricOffsetFor(track));
+        audio.currentTime = audio.duration ? Math.min(target, Math.max(0, audio.duration - 0.05)) : target;
+        lastLyricsIndex = -1; updateTimeDisplay(); updateSyncedLyrics(true); savePlayerState(true);
+      };
+    });
     lastLyricsIndex = -1; updateSyncedLyrics(true);
   } else if (track.lyrics?.trim()) {
     content.innerHTML = `<p class="plain-lyrics">${escapeHTML(track.lyrics)}</p>`; lastLyricsIndex = -1;
@@ -995,6 +1013,34 @@ function schedulePlaybackDiagnostic(track, token, reason, startTime) {
       toast('Zombie could not keep this song playing');
     }
   }, 900);
+}
+function clearBackgroundStallWatchdog(reason = 'cleared') {
+  if (!backgroundStallWatchdog) return;
+  window.clearTimeout(backgroundStallWatchdog.timer);
+  playbackDebug('background-stall-watchdog-cleared', { reason, next: trackDebug(backgroundStallWatchdog.track) });
+  backgroundStallWatchdog = null;
+}
+function armBackgroundStallWatchdog(trigger) {
+  const track = tracks.find((entry) => entry.id === currentId);
+  if (!track || audio.paused || audio.ended || pendingAudio || audio.error || !hasLiveCurrentSource(track)) return;
+  const position = audio.currentTime || 0, source = currentAudioSource(), token = loadToken;
+  clearBackgroundStallWatchdog('rearmed');
+  const watch = { track, position, source, token, trigger, timer: null };
+  watch.timer = window.setTimeout(() => {
+    if (backgroundStallWatchdog !== watch) return;
+    backgroundStallWatchdog = null;
+    const unchanged = Math.abs((audio.currentTime || 0) - position) < .06;
+    const sameSource = currentId === track.id && currentAudioSource() === source && token === loadToken;
+    const stalled = unchanged && sameSource && !audio.paused && !audio.ended && !pendingAudio && !audio.error;
+    playbackDebug(stalled ? 'background-stall-watchdog-confirmed' : 'background-stall-watchdog-healthy', { next: trackDebug(track), trigger, watchedPosition: position, unchanged, sameSource });
+    if (!stalled || Date.now() - lastBackgroundStallRecoveryAt < 15000) return;
+    // This recovery only runs after a real media stall event plus no time progress.
+    // It keeps the same source, track, queue and position and permits one retry.
+    lastBackgroundStallRecoveryAt = Date.now();
+    retryLockScreenResume(track, token, position, 'background-stall-watchdog');
+  }, 2200);
+  backgroundStallWatchdog = watch;
+  playbackDebug('background-stall-watchdog-armed', { next: trackDebug(track), trigger, watchedPosition: position });
 }
 function confirmActualPlayback(track, token, reason) {
   const source = currentAudioSource();
@@ -2725,14 +2771,14 @@ function wireUI() {
   $('#syncPreviousButton').onclick = backLyricsSyncLine; $('#syncRedoButton').onclick = redoLyricsSyncLine; $('#syncSaveButton').onclick = () => { void saveLyricsSync(); }; $('#syncCancelButton').onclick = cancelLyricsSync;
   $('#sheetClose').onclick = closeSheet; $('#sheet').onclick = (event) => { if (event.target === $('#sheet')) closeSheet(); };
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
-  audio.ontimeupdate = () => { const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); updateMediaPosition(); updateSyncedLyrics(); savePlayerState(); };
+  audio.ontimeupdate = () => { clearBackgroundStallWatchdog('time-progress'); const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); updateMediaPosition(); updateSyncedLyrics(); savePlayerState(); };
   audio.onloadedmetadata = () => { updateTimeDisplay(); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
   audio.onplay = () => { if (audioGraph?.context?.state === 'suspended') void audioGraph.context.resume().catch(() => {}); syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
-  audio.onplaying = () => { const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('playing-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); };
-  audio.onpause = () => { syncAmbientMotionState(); capturePausedResumeSnapshot('audio-pause-event'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; animatePlaybackControls('paused'); setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
-  audio.onended = () => { const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
-  audio.onerror = () => { const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); $('#miniPlayer').classList.remove('loading'); setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); };
-  ['waiting', 'stalled', 'suspend', 'emptied', 'abort', 'canplay'].forEach((eventName) => audio.addEventListener(eventName, () => playbackDebug(`audio-${eventName}`)));
+  audio.onplaying = () => { clearBackgroundStallWatchdog('playing-event'); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('playing-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); };
+  audio.onpause = () => { clearBackgroundStallWatchdog('pause-event'); syncAmbientMotionState(); capturePausedResumeSnapshot('audio-pause-event'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; animatePlaybackControls('paused'); setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
+  audio.onended = () => { clearBackgroundStallWatchdog('ended-event'); const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
+  audio.onerror = () => { clearBackgroundStallWatchdog('error-event'); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); $('#miniPlayer').classList.remove('loading'); setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); };
+  ['waiting', 'stalled', 'suspend', 'emptied', 'abort', 'canplay'].forEach((eventName) => audio.addEventListener(eventName, () => { playbackDebug(`audio-${eventName}`); if (eventName === 'waiting' || eventName === 'stalled') armBackgroundStallWatchdog(eventName); else if (eventName === 'canplay') clearBackgroundStallWatchdog('canplay'); }));
   let miniTouch = null, fullTouchY = null, sheetTouchY = null;
   $('#miniPlayer').addEventListener('touchstart', (event) => { if (event.target.closest('#miniPrevious,#miniPlay,#miniNext')) { miniTouch = null; return; } const touch = event.changedTouches[0]; miniTouch = touch ? { x: touch.clientX, y: touch.clientY, direction: null } : null; }, { passive: true });
   $('#miniPlayer').addEventListener('touchmove', (event) => { const touch = event.changedTouches[0]; if (!miniTouch || !touch) return; const dx = touch.clientX - miniTouch.x, dy = touch.clientY - miniTouch.y; if (!miniTouch.direction && Math.max(Math.abs(dx), Math.abs(dy)) > 8) miniTouch.direction = Math.abs(dx) > Math.abs(dy) * 1.25 ? 'horizontal' : 'vertical'; if (miniTouch.direction === 'horizontal') { const offset = Math.max(-30, Math.min(30, dx * 0.22)); $('#miniPlayer').style.transform = `translateX(${offset}px)`; $('#miniPlayer').classList.add('swiping'); } else if (miniTouch.direction === 'vertical' && dy < 0) { const lift = Math.max(-10, dy * 0.12); $('#miniPlayer').style.transform = `translateY(${lift}px) scale(1.004)`; $('#miniPlayer').classList.add('swiping'); } }, { passive: true });
@@ -2772,7 +2818,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.8').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.4.9').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
@@ -2792,5 +2838,5 @@ document.addEventListener('visibilitychange', () => {
   else { void syncNowPlayingVisual(track); reconcilePlaybackAfterForeground(); schedulePendingImportResume(); }
   playbackDebug(`visibility-${document.visibilityState}`, { next: trackDebug(track), pausedSourceAlive: hasLivePausedSource(track) });
 });
-document.addEventListener('freeze', () => playbackDebug('document-freeze', { pausedSourceAlive: hasLivePausedSource(tracks.find((entry) => entry.id === currentId)) }));
+document.addEventListener('freeze', () => { savePlayerState(true); playbackDebug('document-freeze', { pausedSourceAlive: hasLivePausedSource(tracks.find((entry) => entry.id === currentId)), restoredPlaybackState }); });
 document.addEventListener('resume', () => playbackDebug('document-resume', { pausedSourceAlive: hasLivePausedSource(tracks.find((entry) => entry.id === currentId)) }));
