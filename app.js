@@ -21,7 +21,7 @@ let activeQueueSource = 'library';
 let repeatMode = 'off';
 let artTarget = null, lyricsTarget = null, visualTarget = null, activeLyricsId = null, lastLyricsIndex = -1, visualLoadToken = 0;
 let lyricsSyncDraft = null, lyricsManualScrollUntil = 0, lyricsAutoScrollUntil = 0;
-let lastNowPlayingLyricIndex = -2, nowPlayingLyricsTrackId = null, lyricsFocusActive = false, visualMinimalActive = false, visualMinimalControlsVisible = false, lyricsFocusAnimationToken = 0, seekSaveTimer = null;
+let lastNowPlayingLyricIndex = -2, nowPlayingLyricsTrackId = null, lyricsFocusActive = false, lyricsFocusDefaultActive = false, visualMinimalActive = false, visualMinimalControlsVisible = false, lyricsFocusAnimationToken = 0, lyricSyncRevision = 0, seekSaveTimer = null;
 const LYRICS_PROVIDER = Object.freeze({ name: 'LRCLIB', baseUrl: 'https://lrclib.net/api' });
 const LYRICS_REQUEST_GAP_MS = 420, LYRICS_REQUEST_TIMEOUT_MS = 8500;
 let lyricSearchQueue = [], lyricSearchWorkerRunning = false;
@@ -36,7 +36,8 @@ let pendingImportCardDismissed = false, linkFilePickerOpen = false, pendingImpor
 const PENDING_IMPORT_KEY = 'pendingLinkImport';
 const BACKUP_FORMAT = 'zombie-backup';
 const FULL_BACKUP_LIMIT = 40 * 1024 * 1024;
-const preferences = { layout: 'comfortable', appearance: 'soft', visualMode: 'artwork', playbackRate: 1, sort: 'recent', dynamicColours: 'balanced', colourIntensity: 'medium', zombieAccent: 'purple', visualEffects: true, timeDisplay: 'remaining', reduceAnimations: false, lyricsDisplay: 'single' };
+const DEFAULT_LIBRARY_SHELVES = Object.freeze({ nowPlaying: true, recentlyPlayed: true, favorites: true, recentlyAdded: true });
+const preferences = { layout: 'shelves', libraryShelves: { ...DEFAULT_LIBRARY_SHELVES }, appearance: 'soft', visualMode: 'artwork', playbackRate: 1, sort: 'recent', dynamicColours: 'balanced', colourIntensity: 'medium', zombieAccent: 'purple', visualEffects: true, timeDisplay: 'remaining', reduceAnimations: false, lyricsDisplay: 'single' };
 const AUDIO_MOD_DEFAULTS = { bass: 0, treble: 0, vocal: 'off', reverb: 'off', speed: 1, pitch: 0, eq: { bass: 0, lowMid: 0, mid: 0, highMid: 0, treble: 0 }, remember: true, preset: 'normal' };
 const AUDIO_PRESETS = {
   normal: { label: 'Normal', values: {} },
@@ -131,21 +132,30 @@ function setMarqueeText(selector, value) {
     if (distance > 4) { element.style.setProperty('--marquee-distance', `-${distance}px`); element.classList.add('marquee-active'); }
   });
 }
-function activeSyncedLyricIndex(track) {
-  if (!track?.syncedLyrics?.length) return -1;
-  const timelineTime = lyricPlaybackTime(track);
+function lyricSyncState(track = tracks.find((entry) => entry.id === currentId)) {
+  const currentTrack = track?.id === currentId ? track : tracks.find((entry) => entry.id === currentId);
+  const lines = currentTrack?.syncedLyrics || [];
+  const audioTime = Number.isFinite(audio.currentTime) ? Math.max(0, audio.currentTime) : 0;
+  const timelineTime = Math.max(0, audioTime - lyricOffsetFor(currentTrack));
   let index = -1;
-  for (let cursor = 0; cursor < track.syncedLyrics.length; cursor += 1) {
-    if (track.syncedLyrics[cursor].time <= timelineTime + 0.08) index = cursor; else break;
+  for (let cursor = 0; cursor < lines.length; cursor += 1) {
+    if (Number(lines[cursor].time) <= timelineTime + 0.08) index = cursor; else break;
   }
-  return index;
+  return { track: currentTrack || null, lines, audioTime, timelineTime, index };
+}
+function activeSyncedLyricIndex(track) { return lyricSyncState(track).index; }
+function resetLyricRenderState() {
+  lastLyricsIndex = -1;
+  lastNowPlayingLyricIndex = -2;
+  lyricSyncRevision += 1;
+  lyricsFocusAnimationToken += 1;
 }
 function seekToSyncedLyric(track, line) {
   if (!track || !line || !Number.isFinite(Number(line.time))) return;
   const target = Math.max(0, Number(line.time) + lyricOffsetFor(track));
   audio.currentTime = audio.duration ? Math.min(target, Math.max(0, audio.duration - 0.05)) : target;
-  lastLyricsIndex = -1; lastNowPlayingLyricIndex = -2;
-  updateTimeDisplay(); updateSyncedLyrics(true); syncNowPlayingLyrics(track, true); savePlayerState(true);
+  resetLyricRenderState();
+  updateTimeDisplay(); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'lyric-tap' }); savePlayerState(true);
 }
 function setNowPlayingLyricLine(element, track, line) {
   if (!element) return;
@@ -154,12 +164,12 @@ function setNowPlayingLyricLine(element, track, line) {
   element.onclick = () => seekToSyncedLyric(track, line);
 }
 function resetNowPlayingLyrics(track = null) {
-  nowPlayingLyricsTrackId = track?.id || null; lastNowPlayingLyricIndex = -2; lyricsFocusAnimationToken += 1;
+  nowPlayingLyricsTrackId = track?.id || null; resetLyricRenderState();
   $('#npLiveLyrics')?.classList.add('hidden');
   setNowPlayingLyricLine($('#npLiveLyricLine'), null, null);
   const focus = $('#npLyricsFocusPanel'); if (focus) { focus.replaceChildren(); delete focus.dataset.focusTrack; delete focus.dataset.focusCentre; }
 }
-function renderLyricsFocus(track, activeIndex) {
+function renderLyricsFocus(track, activeIndex, { animate = true } = {}) {
   const panel = $('#npLyricsFocusPanel'); if (!panel) return;
   if (!lyricsFocusActive || !track) { panel.classList.add('hidden'); panel.replaceChildren(); return; }
   panel.classList.remove('hidden');
@@ -190,27 +200,42 @@ function renderLyricsFocus(track, activeIndex) {
     const previousCentre = Number(panel.dataset.focusCentre);
     panel.dataset.focusCentre = String(centre);
     if (needsStructure || previousCentre !== centre) {
-      const token = ++lyricsFocusAnimationToken; const list = panel.querySelector('.np-focus-lines');
+      const list = panel.querySelector('.np-focus-lines');
       list?.classList.remove('lyrics-shifting');
+      if (!animate) { lyricsFocusAnimationToken += 1; return; }
+      const token = ++lyricsFocusAnimationToken;
       requestAnimationFrame(() => { if (token === lyricsFocusAnimationToken && lyricsFocusActive && panel.dataset.focusTrack === track.id) list?.classList.add('lyrics-shifting'); });
     }
   }
 }
-function syncNowPlayingLyrics(track = tracks.find((entry) => entry.id === currentId), force = false) {
+function syncNowPlayingLyrics(track = tracks.find((entry) => entry.id === currentId), force = false, state = null, { animate = true } = {}) {
   const live = $('#npLiveLyrics'), liveLine = $('#npLiveLyricLine'); if (!live || !liveLine) return;
   if (!track || track.id !== currentId) { resetNowPlayingLyrics(null); return; }
   if (nowPlayingLyricsTrackId !== track.id) resetNowPlayingLyrics(track);
-  const lines = track.syncedLyrics || []; const activeIndex = activeSyncedLyricIndex(track);
-  const showLive = Boolean(lines.length && activeIndex >= 0 && !lyricsFocusActive && (preferences.lyricsDisplay !== 'off' || visualMinimalActive));
+  const lyricState = state || lyricSyncState(track); const lines = lyricState.lines; const activeIndex = lyricState.index;
+  const showLive = Boolean(lines.length && activeIndex >= 0 && !lyricsFocusActive && preferences.lyricsDisplay === 'single');
   live.classList.toggle('hidden', !showLive);
   if (showLive && (force || activeIndex !== lastNowPlayingLyricIndex)) setNowPlayingLyricLine(liveLine, track, lines[activeIndex]);
   if (!showLive) setNowPlayingLyricLine(liveLine, null, null);
-  if (lyricsFocusActive && (force || activeIndex !== lastNowPlayingLyricIndex)) renderLyricsFocus(track, activeIndex);
+  if (lyricsFocusActive && (force || activeIndex !== lastNowPlayingLyricIndex)) renderLyricsFocus(track, activeIndex, { animate });
   lastNowPlayingLyricIndex = activeIndex;
 }
-function setLyricsFocusMode(enabled) {
+function synchronizeLyricsFromAudio({ force = false, animate = true, reason = 'playback' } = {}) {
+  const state = lyricSyncState();
+  const lyricsScreen = $('#lyricsScreen');
+  if (!state.track) { syncNowPlayingLyrics(null, true, state, { animate: false }); return state; }
+  if (lyricsScreen && !lyricsScreen.classList.contains('hidden')) {
+    if (activeLyricsId !== state.track.id) { activeLyricsId = state.track.id; renderLyrics(state.track); }
+    updateSyncedLyrics(force, state);
+  }
+  syncNowPlayingLyrics(state.track, force, state, { animate });
+  return state;
+}
+function setLyricsFocusMode(enabled, { defaultMode = false } = {}) {
   const screen = $('#nowPlayingScreen'); if (!screen) return;
-  lyricsFocusActive = Boolean(enabled && currentId);
+  const track = tracks.find((entry) => entry.id === currentId);
+  lyricsFocusDefaultActive = Boolean(enabled && defaultMode);
+  lyricsFocusActive = Boolean(enabled && track && (!defaultMode || track.syncedLyrics?.length));
   if (lyricsFocusActive) setVisualMinimalMode(false, true);
   screen.classList.toggle('lyrics-focus-active', lyricsFocusActive);
   if (!lyricsFocusActive) {
@@ -224,7 +249,7 @@ function setLyricsFocusMode(enabled) {
     }
   }
   const button = $('#lyricsFocusButton'); if (button) { button.classList.toggle('active', lyricsFocusActive); button.setAttribute('aria-pressed', String(lyricsFocusActive)); button.textContent = lyricsFocusActive ? '≡ Lyrics On' : '≡ Lyrics Focus'; }
-  syncNowPlayingLyrics(tracks.find((entry) => entry.id === currentId), true);
+  synchronizeLyricsFromAudio({ force: true, animate: false, reason: lyricsFocusActive ? 'focus-enter' : 'focus-exit' });
 }
 function setVisualMinimalMode(enabled, fromLyricsFocus = false) {
   const screen = $('#nowPlayingScreen'); if (!screen) return;
@@ -232,7 +257,7 @@ function setVisualMinimalMode(enabled, fromLyricsFocus = false) {
   if (visualMinimalActive && !fromLyricsFocus) setLyricsFocusMode(false);
   screen.classList.toggle('visual-minimal', visualMinimalActive); screen.classList.remove('visual-controls-revealed');
   const button = $('#npVisualModeToggle'); if (button) { button.classList.toggle('active', visualMinimalActive); button.setAttribute('aria-pressed', String(visualMinimalActive)); button.setAttribute('aria-label', visualMinimalActive ? 'Leave visual mode' : 'Open visual mode'); }
-  syncNowPlayingLyrics(tracks.find((entry) => entry.id === currentId), true);
+  synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'visual-mode' });
 }
 function toggleVisualMinimalControls() {
   if (!visualMinimalActive) return;
@@ -369,7 +394,8 @@ function applyPreferences() {
   document.documentElement.dataset.zombieReducedMotion = preferences.reduceAnimations ? 'on' : 'off';
   audio.playbackRate = preferences.playbackRate;
   if ($('#sortSelect')) $('#sortSelect').value = preferences.sort;
-  $('#layoutStatus') && ($('#layoutStatus').textContent = preferences.layout === 'compact' ? 'Compact list' : preferences.layout === 'grid' ? 'Artwork grid' : 'Comfortable list');
+  $('#layoutStatus') && ($('#layoutStatus').textContent = preferences.layout === 'compact' ? 'Compact List' : preferences.layout === 'grid' ? 'Artwork Grid' : 'Shelves');
+  $('#libraryCustomizeStatus') && ($('#libraryCustomizeStatus').textContent = `${Object.values(preferences.libraryShelves).filter(Boolean).length} shelf sections shown`);
   $('#appearanceStatus') && ($('#appearanceStatus').textContent = preferences.appearance === 'pure' ? 'Pure Black' : preferences.appearance === 'ambient' ? 'Artwork Ambient' : 'Soft Black');
   $('#visualStatus') && ($('#visualStatus').textContent = preferences.visualMode === 'animation' ? 'Animation when a song has one' : 'Artwork by default');
   $('#visualButton') && ($('#visualButton').textContent = preferences.visualMode === 'animation' ? '◇ Animation' : '◇ Artwork');
@@ -385,7 +411,8 @@ function applyPreferences() {
 async function restorePreferences() {
   const record = await getRecord('settings', 'appPreferences').catch(() => null);
   if (record) {
-    if (['compact', 'comfortable', 'grid'].includes(record.layout)) preferences.layout = record.layout;
+    if (['compact', 'grid', 'shelves', 'comfortable'].includes(record.layout)) preferences.layout = record.layout === 'comfortable' ? 'shelves' : record.layout;
+    if (record.libraryShelves && typeof record.libraryShelves === 'object') preferences.libraryShelves = { ...DEFAULT_LIBRARY_SHELVES, ...Object.fromEntries(Object.entries(record.libraryShelves).filter(([key, value]) => key in DEFAULT_LIBRARY_SHELVES && typeof value === 'boolean')) };
     if (['pure', 'soft', 'ambient'].includes(record.appearance)) preferences.appearance = record.appearance;
     if (['artwork', 'animation'].includes(record.visualMode)) preferences.visualMode = record.visualMode;
     if ([0.8, 1, 1.2, 1.5].includes(record.playbackRate)) preferences.playbackRate = record.playbackRate;
@@ -402,6 +429,38 @@ async function restorePreferences() {
 }
 function savePreferences() { saveRecord('settings', { key: 'appPreferences', ...preferences }).catch(() => {}); applyPreferences(); }
 function cyclePreference(key, values) { const next = values[(values.indexOf(preferences[key]) + 1) % values.length]; preferences[key] = next; savePreferences(); render(); }
+function applyLibraryLayout(layout) {
+  const next = ['shelves', 'grid', 'compact'].includes(layout) ? layout : 'shelves';
+  if (preferences.layout === next) { closeSheet(); return; }
+  const area = $('#contentArea'); const scrollTop = area?.scrollTop || 0, pageScroll = window.scrollY || 0;
+  preferences.layout = next; savePreferences(); render();
+  requestAnimationFrame(() => { const nextArea = $('#contentArea'); if (nextArea && scrollTop) nextArea.scrollTop = scrollTop; if (pageScroll) window.scrollTo({ top: pageScroll, behavior: 'auto' }); });
+  closeSheet(); toast(`${next === 'grid' ? 'Artwork Grid' : next === 'compact' ? 'Compact List' : 'Shelves'} selected`);
+}
+function openLibraryLayoutSheet() {
+  const options = [
+    { id: 'shelves', title: 'Shelves', copy: 'Home-style Now Playing and horizontal music shelves.', sample: '<i></i><i></i><i></i>' },
+    { id: 'grid', title: 'Artwork Grid', copy: 'Two-column artwork cards for browsing visually.', sample: '<i></i><i></i><i></i><i></i>' },
+    { id: 'compact', title: 'Compact List', copy: 'Dense song rows so more music fits on screen.', sample: '<i></i><i></i><i></i><i></i>' },
+  ];
+  $('#sheetTitle').textContent = 'Library layout';
+  $('#sheetContent').innerHTML = `<p class="sheet-note">Choose how your music is shown. Search, filters, queue, and playback stay exactly where they are.</p><div class="library-layout-picker">${options.map((option) => `<button class="library-layout-option ${preferences.layout === option.id ? 'selected-option' : ''}" data-library-layout="${option.id}" aria-pressed="${preferences.layout === option.id}"><span class="library-layout-preview preview-${option.id}">${option.sample}</span><span><strong>${option.title}</strong><small>${option.copy}</small></span><b>${preferences.layout === option.id ? '✓' : ''}</b></button>`).join('')}</div>`;
+  $('#sheetContent').querySelectorAll('[data-library-layout]').forEach((button) => { button.onclick = () => applyLibraryLayout(button.dataset.libraryLayout); });
+  showSheet();
+}
+function openLibraryCustomizeSheet() {
+  const labels = { nowPlaying: 'Now Playing', recentlyPlayed: 'Recently Played', favorites: 'Favorites', recentlyAdded: 'Recently Added' };
+  $('#sheetTitle').textContent = 'Customize shelves';
+  $('#sheetContent').innerHTML = `<p class="sheet-note">Choose the sections shown in the Shelves layout. Artwork Grid and Compact List stay focused on your song browser.</p><div class="library-shelf-toggles">${Object.entries(labels).map(([key, label]) => `<label><input type="checkbox" data-library-shelf="${key}" ${preferences.libraryShelves[key] ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div>`;
+  $('#sheetContent').querySelectorAll('[data-library-shelf]').forEach((input) => {
+    input.onchange = () => {
+      preferences.libraryShelves[input.dataset.libraryShelf] = input.checked;
+      savePreferences();
+      if (preferences.layout === 'shelves' && currentView === 'songs' && !collectionFilter && !$('#searchInput').value.trim()) render();
+    };
+  });
+  showSheet();
+}
 function cleanTrack(track) { const { blob, ...metadata } = track; return metadata; }
 function bytesToBase64(bytes) { const chunks = []; for (let offset = 0; offset < bytes.length; offset += 0x8000) chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))); return btoa(chunks.join('')); }
 function base64ToBlob(value, type = 'application/octet-stream') { const text = atob(value); const bytes = new Uint8Array(text.length); for (let index = 0; index < text.length; index += 1) bytes[index] = text.charCodeAt(index); return new Blob([bytes], { type }); }
@@ -748,7 +807,7 @@ function renderLyrics(track = tracks.find((entry) => entry.id === activeLyricsId
         if (lyric) seekToSyncedLyric(track, lyric);
       };
     });
-    lastLyricsIndex = -1; updateSyncedLyrics(true);
+    lastLyricsIndex = -1; updateSyncedLyrics(true, lyricSyncState(track));
   } else if (track.lyrics?.trim()) {
     content.innerHTML = `<p class="plain-lyrics">${escapeHTML(track.lyrics)}</p>`; lastLyricsIndex = -1;
   } else {
@@ -756,10 +815,11 @@ function renderLyrics(track = tracks.find((entry) => entry.id === activeLyricsId
     $('#addLyricsEmpty').onclick = () => openLyricsEditor(track.id);
   }
 }
-function updateSyncedLyrics(force = false) {
+function updateSyncedLyrics(force = false, state = null) {
   if (!activeLyricsId || lyricsSyncDraft || $('#lyricsScreen').classList.contains('hidden')) return;
   const track = tracks.find((entry) => entry.id === activeLyricsId); if (!track?.syncedLyrics?.length) return;
-  const activeIndex = activeSyncedLyricIndex(track);
+  const lyricState = state?.track?.id === track.id ? state : lyricSyncState(track);
+  const activeIndex = lyricState.index;
   if (!force && activeIndex === lastLyricsIndex) return;
   lastLyricsIndex = activeIndex;
   const lines = [...$('#lyricsContent').querySelectorAll('[data-lyric-index]')];
@@ -777,13 +837,13 @@ function updateSyncedLyrics(force = false) {
 }
 function returnLyricsToCurrent() {
   lyricsManualScrollUntil = 0; $('#lyricsContent').classList.remove('manual-scroll'); $('#lyricsReturnCurrent')?.classList.add('hidden');
-  clearTimeout(window.zombieLyricsFollowTimer); lastLyricsIndex = -1; updateSyncedLyrics(true);
+  clearTimeout(window.zombieLyricsFollowTimer); lastLyricsIndex = -1; synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'lyrics-return-current' });
 }
 function openLyrics(id = currentId) {
   const track = tracks.find((entry) => entry.id === id); if (!track) { toast('Choose a song first'); return; }
-  lyricsSyncDraft = null; lyricsManualScrollUntil = 0; $('#lyricsContent').classList.remove('manual-scroll'); $('#lyricsReturnCurrent').classList.add('hidden'); setLyricsScreenMode(false); activeLyricsId = id; applyAmbientPalette(track); lastLyricsIndex = -1; const screen = $('#lyricsScreen'); screen.classList.remove('hidden'); $('#lyricsButton').classList.add('active'); syncModalScrollLock(); requestAnimationFrame(() => screen.classList.add('presented')); renderLyrics(track);
+  lyricsSyncDraft = null; lyricsManualScrollUntil = 0; $('#lyricsContent').classList.remove('manual-scroll'); $('#lyricsReturnCurrent').classList.add('hidden'); setLyricsScreenMode(false); activeLyricsId = id; applyAmbientPalette(track); lastLyricsIndex = -1; const screen = $('#lyricsScreen'); screen.classList.remove('hidden'); $('#lyricsButton').classList.add('active'); syncModalScrollLock(); requestAnimationFrame(() => screen.classList.add('presented')); renderLyrics(track); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'lyrics-open' });
 }
-function closeLyrics() { lyricsSyncDraft = null; lyricsManualScrollUntil = 0; clearTimeout(window.zombieLyricsFollowTimer); $('#lyricsReturnCurrent').classList.add('hidden'); setLyricsScreenMode(false); const screen = $('#lyricsScreen'); screen.classList.remove('presented'); $('#lyricsButton').classList.remove('active'); setTimeout(() => { screen.classList.add('hidden'); syncModalScrollLock(); }, 180); activeLyricsId = null; lastLyricsIndex = -1; }
+function closeLyrics() { lyricsSyncDraft = null; lyricsManualScrollUntil = 0; clearTimeout(window.zombieLyricsFollowTimer); $('#lyricsReturnCurrent').classList.add('hidden'); setLyricsScreenMode(false); const screen = $('#lyricsScreen'); screen.classList.remove('presented'); $('#lyricsButton').classList.remove('active'); activeLyricsId = null; lastLyricsIndex = -1; const state = lyricSyncState(); syncNowPlayingLyrics(state.track, true, state, { animate: false }); setTimeout(() => { screen.classList.add('hidden'); syncModalScrollLock(); }, 180); }
 function openLyricsMenu() {
   const track = tracks.find((entry) => entry.id === activeLyricsId); if (!track) return;
   $('#sheetTitle').textContent = 'Lyrics';
@@ -803,7 +863,7 @@ function openLyricsOffset() {
   const track = tracks.find((entry) => entry.id === activeLyricsId); if (!track) return;
   const offset = lyricOffsetFor(track); $('#sheetTitle').textContent = 'Lyrics sync';
   $('#sheetContent').innerHTML = `<p class="sheet-note">Shift every timestamp for this song. Positive makes lyrics appear later; negative makes them appear earlier. Saved offline for this song.</p><div class="lyrics-offset-readout" id="lyricsOffsetValue">${formatLyricOffset(offset)}</div><div class="lyrics-offset-buttons"><button class="sheet-option" data-lyrics-offset="-1">−1.0s</button><button class="sheet-option" data-lyrics-offset="-.5">−0.5s</button><button class="sheet-option" data-lyrics-offset=".5">+0.5s</button><button class="sheet-option" data-lyrics-offset="1">+1.0s</button></div><label class="edit-field">Manual offset (seconds)<input id="lyricsOffsetInput" type="number" inputmode="decimal" min="-60" max="60" step="0.1" value="${offset}"></label><button class="sheet-option" id="saveLyricsOffset">Set offset</button>`;
-  const applyOffset = async (value) => { if (!Number.isFinite(value)) return; track.lyricOffset = Math.max(-60, Math.min(60, Math.round(value * 100) / 100)); await saveRecord('tracks', track); lastLyricsIndex = -1; updateSyncedLyrics(true); openLyricsOffset(); };
+  const applyOffset = async (value) => { if (!Number.isFinite(value)) return; track.lyricOffset = Math.max(-60, Math.min(60, Math.round(value * 100) / 100)); await saveRecord('tracks', track); resetLyricRenderState(); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'lyrics-offset' }); openLyricsOffset(); };
   $('#sheetContent').querySelectorAll('[data-lyrics-offset]').forEach((button) => { button.onclick = () => { void applyOffset(offset + Number(button.dataset.lyricsOffset)); }; });
   $('#saveLyricsOffset').onclick = () => { void applyOffset(Number($('#lyricsOffsetInput').value)); };
   showSheet();
@@ -1487,7 +1547,8 @@ function render() {
   else if (currentView === 'playlists') renderPlaylists(area);
   else {
     const list = visibleTracks();
-    if (currentView === 'songs' && !collectionFilter && !$('#searchInput').value.trim() && tracks.length) renderHomeShelves(area);
+    const isShelfHome = preferences.layout === 'shelves' && currentView === 'songs' && !collectionFilter && !$('#searchInput').value.trim() && tracks.length;
+    if (isShelfHome) renderHomeShelves(area);
     renderTrackList(area, list, null, queueSourceForCurrentView());
   }
 }
@@ -1504,19 +1565,21 @@ function appendHomeShelf(area, title, subtitle, list, activeQueueIds = list.map(
 }
 function renderHomeShelves(area) {
   const current = tracks.find((track) => track.id === currentId);
-  const hero = document.createElement(current ? 'button' : 'article'); hero.className = 'home-hero';
-  hero.innerHTML = current
-    ? `<p>NOW PLAYING</p><strong>${escapeHTML(current.title)}</strong><small>${escapeHTML(current.artist)} · ${audio.paused ? 'Ready when you are' : 'Playing from your local library'}</small><span class="hero-now">${current.emoji} <span>Open Now Playing</span></span>`
-    : '<p>YOUR MUSIC. YOUR RULES.</p><strong>Built for your local library.</strong><small>Offline-ready playback, your playlists, your lyrics.</small>';
-  if (current) hero.onclick = openNowPlaying;
-  area.append(hero);
+  if (preferences.libraryShelves.nowPlaying) {
+    const hero = document.createElement(current ? 'button' : 'article'); hero.className = 'home-hero';
+    hero.innerHTML = current
+      ? `<p>NOW PLAYING</p><strong>${escapeHTML(current.title)}</strong><small>${escapeHTML(current.artist)} · ${audio.paused ? 'Ready when you are' : 'Playing from your local library'}</small><span class="hero-now">${current.emoji} <span>Open Now Playing</span></span>`
+      : '<p>YOUR MUSIC. YOUR RULES.</p><strong>Built for your local library.</strong><small>Offline-ready playback, your playlists, your lyrics.</small>';
+    if (current) hero.onclick = openNowPlaying;
+    area.append(hero);
+  }
   const playedQueue = tracks.filter((track) => track.lastPlayed).sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
   const favoritesQueue = tracks.filter((track) => track.isFavorite).sort((a, b) => (b.lastPlayed || 0) - (a.lastPlayed || 0));
   const addedQueue = [...tracks].sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
   const recentlyPlayed = playedQueue.slice(0, 8), favorites = favoritesQueue.slice(0, 8), recentlyAdded = addedQueue.slice(0, 8);
-  if (recentlyPlayed.length) appendHomeShelf(area, 'Recently played', 'Pick up where you left off', recentlyPlayed, playedQueue.map((track) => track.id), 'recently-played');
-  if (favorites.length) appendHomeShelf(area, 'Favorites', 'Saved on this device', favorites, favoritesQueue.map((track) => track.id), 'favorites');
-  appendHomeShelf(area, 'Recently added', 'Your latest imports', recentlyAdded, addedQueue.map((track) => track.id), 'recently-added');
+  if (preferences.libraryShelves.recentlyPlayed && recentlyPlayed.length) appendHomeShelf(area, 'Recently played', 'Pick up where you left off', recentlyPlayed, playedQueue.map((track) => track.id), 'recently-played');
+  if (preferences.libraryShelves.favorites && favorites.length) appendHomeShelf(area, 'Favorites', 'Saved on this device', favorites, favoritesQueue.map((track) => track.id), 'favorites');
+  if (preferences.libraryShelves.recentlyAdded) appendHomeShelf(area, 'Recently added', 'Your latest imports', recentlyAdded, addedQueue.map((track) => track.id), 'recently-added');
 }
 function renderTrackList(area, list, playlist = null, queueSource = queueSourceForCurrentView()) {
   $('#librarySummary').textContent = libraryStats(list);
@@ -1540,7 +1603,7 @@ function renderTrackList(area, list, playlist = null, queueSource = queueSourceF
   }
   list.forEach((track, position) => {
     const item = document.createElement('article'); item.className = `track ${track.id === currentId ? 'active' : ''}`;
-    item.innerHTML = `<button class="track-main" aria-label="Play ${escapeHTML(track.title)}"><span class="cover art-${artVariant(track)}" data-art="${track.id}">Z</span><span class="track-copy"><strong><i class="title-emoji">${track.emoji}</i>${escapeHTML(track.title)}${track.id === currentId && !audio.paused ? '<span class="playing-bars" aria-label="Playing"><i></i><i></i><i></i></span>' : ''}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album)}${track.genre ? ` · <em>${escapeHTML(track.genre)}</em>` : ''}${lyricsStatusMarkup(track)}</small></span></button><button class="favorite ${track.isFavorite ? 'selected' : ''}" aria-label="${track.isFavorite ? 'Remove from' : 'Add to'} favorites">${track.isFavorite ? '♥' : '♡'}</button><button class="more" aria-label="Song options">⋯</button>${playlist ? `<span class="reorder"><button aria-label="Move song up">↑</button><button aria-label="Move song down">↓</button><button aria-label="Remove from playlist">×</button></span>` : '<button class="delete" aria-label="Delete from device">×</button>'}`;
+    item.innerHTML = `<button class="track-main" aria-label="Play ${escapeHTML(track.title)}"><span class="cover art-${artVariant(track)}" data-art="${track.id}">Z</span><span class="track-copy"><strong><i class="title-emoji">${track.emoji}</i>${escapeHTML(track.title)}${track.id === currentId && !audio.paused ? '<span class="playing-bars" aria-label="Playing"><i></i><i></i><i></i></span>' : ''}</strong><small>${escapeHTML(track.artist)} · ${escapeHTML(track.album)}${track.genre ? ` · <em>${escapeHTML(track.genre)}</em>` : ''}${lyricsStatusMarkup(track)}</small></span>${preferences.layout === 'compact' && track.duration ? `<time class="track-duration">${formatTime(track.duration)}</time>` : ''}</button><button class="favorite ${track.isFavorite ? 'selected' : ''}" aria-label="${track.isFavorite ? 'Remove from' : 'Add to'} favorites">${track.isFavorite ? '♥' : '♡'}</button><button class="more" aria-label="Song options">⋯</button>${playlist ? `<span class="reorder"><button aria-label="Move song up">↑</button><button aria-label="Move song down">↓</button><button aria-label="Remove from playlist">×</button></span>` : '<button class="delete" aria-label="Delete from device">×</button>'}`;
     item.querySelector('.track-main').onclick = () => playTrack(track.id, list.map((entry) => entry.id), { queueSource });
     item.querySelector('.favorite').onclick = () => toggleFavorite(track.id);
     item.querySelector('.more').onclick = () => openSongOptions(track.id);
@@ -1709,7 +1772,7 @@ async function playTrack(id, sourceIds = null, options = {}) {
     }
     pendingAudio = { id, url: nextUrl, token, oldUrl, previous: trackDebug(previousTrack), previousEnded: sourceWasEnded || ['ended', 'foreground-ended-recovery'].includes(options.reason), reason: options.reason || 'manual' };
     audio.src = nextUrl;
-    if (resumePosition > 0) audio.addEventListener('loadedmetadata', () => { audio.currentTime = Math.min(resumePosition, Math.max(0, (audio.duration || resumePosition) - 0.05)); restoredPosition = 0; }, { once: true });
+    if (resumePosition > 0) audio.addEventListener('loadedmetadata', () => { audio.currentTime = Math.min(resumePosition, Math.max(0, (audio.duration || resumePosition) - 0.05)); restoredPosition = 0; resetLyricRenderState(); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'session-position-restore' }); }, { once: true });
     else restoredPosition = 0;
     // Setting src starts loading. Calling load() here can reset a background iPhone audio pipeline, so play() is the readiness gate.
     playbackDebug('source-attached', { previous: trackDebug(previousTrack), next: trackDebug(track), blobLoaded: true, objectUrlCreated: true, readyGate: 'audio.play promise' });
@@ -1749,7 +1812,9 @@ function paintNowPlayingTrack(track, changed = false) {
   applyAmbientPalette(track); setMarqueeText('#nowTitle', track.title); $('#nowArtist').textContent = track.artist;
   applyArtwork($('#miniArt'), track); applyArtwork($('#npArt'), track); applyArtwork($('#npBackdrop'), track);
   $('#npEmoji').textContent = track.emoji; setMarqueeText('#npTitle', track.title); setMarqueeText('#npArtist', track.artist); $('#npAlbum').textContent = track.album || 'Single';
-  $('#npFavorite').textContent = track.isFavorite ? '♥' : '♡'; $('#npFavorite').setAttribute('aria-pressed', String(track.isFavorite)); syncAmbientMotionState(); syncNowPlayingLyrics(track, true); void syncNowPlayingVisual(track);
+  $('#npFavorite').textContent = track.isFavorite ? '♥' : '♡'; $('#npFavorite').setAttribute('aria-pressed', String(track.isFavorite)); syncAmbientMotionState();
+  if (lyricsFocusDefaultActive && !track.syncedLyrics?.length) setLyricsFocusMode(false);
+  synchronizeLyricsFromAudio({ force: true, animate: false, reason: changed ? 'song-change' : 'now-playing-paint' }); void syncNowPlayingVisual(track);
   if (changed) {
     ['#miniPlayer', '#nowPlayingScreen'].forEach((selector) => {
       const panel = $(selector); panel.classList.remove('track-leaving', 'song-changing', 'artwork-changing');
@@ -2071,7 +2136,7 @@ function setMiniPlayerTransitionOrigin(screen) {
 function openNowPlaying() {
   if (!currentId) return;
   clearTimeout(panelTimer); const screen = $('#nowPlayingScreen'), mini = $('#miniPlayer'); screen.classList.remove('hidden', 'closing'); screen.classList.add('from-mini');
-  setLyricsFocusMode(preferences.lyricsDisplay === 'focus'); setVisualMinimalMode(false);
+  setLyricsFocusMode(preferences.lyricsDisplay === 'focus', { defaultMode: preferences.lyricsDisplay === 'focus' }); setVisualMinimalMode(false); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'now-playing-open' });
   syncModalScrollLock();
   requestAnimationFrame(() => { setMiniPlayerTransitionOrigin(screen); requestAnimationFrame(() => { mini.classList.add('expanding'); screen.classList.add('presented'); syncNowPlaying(tracks.find((entry) => entry.id === currentId)); void syncNowPlayingVisual(); }); });
 }
@@ -2861,7 +2926,7 @@ function wireUI() {
   document.querySelectorAll('.tab').forEach((button) => button.onclick = () => { currentView = button.dataset.view; collectionFilter = null; activePlaylistId = null; render(); });
   document.querySelectorAll('.bottom-nav button').forEach((button) => button.onclick = () => { currentView = button.dataset.nav === 'settings' ? 'settings' : 'songs'; collectionFilter = null; activePlaylistId = null; render(); });
   $('#storageRefresh').onclick = refreshStorageStatus; $('#persistenceButton').onclick = requestPersistentStorage; $('#clearMusicButton').onclick = clearAllMusic;
-  $('#layoutButton').onclick = () => cyclePreference('layout', ['comfortable', 'compact', 'grid']);
+  $('#layoutButton').onclick = openLibraryLayoutSheet; $('#libraryCustomizeButton').onclick = openLibraryCustomizeSheet;
   $('#appearanceButton').onclick = () => cyclePreference('appearance', ['soft', 'pure', 'ambient']);
   $('#visualPreferenceButton').onclick = () => { cyclePreference('visualMode', ['artwork', 'animation']); void syncNowPlayingVisual(); };
   $('#dynamicColoursButton').onclick = () => cyclePreference('dynamicColours', ['balanced', 'full', 'minimal', 'off']);
@@ -2870,7 +2935,7 @@ function wireUI() {
   $('#reduceAnimationsButton').onclick = () => { preferences.reduceAnimations = !preferences.reduceAnimations; savePreferences(); };
   $('#lyricsDisplayButton').onclick = () => {
     cyclePreference('lyricsDisplay', ['off', 'single', 'focus']);
-    if (!$('#nowPlayingScreen').classList.contains('hidden')) setLyricsFocusMode(preferences.lyricsDisplay === 'focus');
+    if (!$('#nowPlayingScreen').classList.contains('hidden')) setLyricsFocusMode(preferences.lyricsDisplay === 'focus', { defaultMode: preferences.lyricsDisplay === 'focus' });
   };
   $('#exportBackupButton').onclick = () => exportBackup(false); $('#exportFullBackupButton').onclick = () => exportBackup(true); $('#restoreBackupButton').onclick = () => $('#backupInput').click();
   $('[data-action="back-to-library"]').onclick = () => { currentView = 'songs'; render(); };
@@ -2880,7 +2945,7 @@ function wireUI() {
   $('#shuffleButton').onclick = () => setShuffleEnabled(!shuffleOn);
   $('#repeatButton').onclick = () => { repeatMode = repeatMode === 'off' ? 'all' : repeatMode === 'all' ? 'one' : 'off'; updatePlayerMode(); toast(`Repeat ${repeatMode}`); };
   const commitSeek = () => { clearTimeout(seekSaveTimer); seekSaveTimer = null; savePlayerState(true); };
-  $('#npSeek').oninput = (event) => { const percent = Number(event.target.value) || 0; event.target.style.setProperty('--seek-progress', `${percent}%`); setWaveformProgress(percent); if (audio.duration) { audio.currentTime = (percent / 100) * audio.duration; $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); clearTimeout(seekSaveTimer); seekSaveTimer = setTimeout(commitSeek, 650); } };
+  $('#npSeek').oninput = (event) => { const percent = Number(event.target.value) || 0; event.target.style.setProperty('--seek-progress', `${percent}%`); setWaveformProgress(percent); if (audio.duration) { audio.currentTime = (percent / 100) * audio.duration; resetLyricRenderState(); $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'seek-bar' }); clearTimeout(seekSaveTimer); seekSaveTimer = setTimeout(commitSeek, 650); } };
   ['change', 'pointerup', 'touchend', 'keyup'].forEach((type) => $('#npSeek').addEventListener(type, commitSeek, { passive: type === 'touchend' }));
   $('#remainingTime').onclick = toggleTimeDisplay;
   $('#volumeControl').oninput = (event) => { audio.volume = Number(event.target.value); savePlayerState(true); };
@@ -2892,13 +2957,14 @@ function wireUI() {
   $('#syncPreviousButton').onclick = backLyricsSyncLine; $('#syncRedoButton').onclick = redoLyricsSyncLine; $('#syncSaveButton').onclick = () => { void saveLyricsSync(); }; $('#syncCancelButton').onclick = cancelLyricsSync;
   $('#sheetClose').onclick = closeSheet; $('#sheet').onclick = (event) => { if (event.target === $('#sheet')) closeSheet(); };
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
-  audio.ontimeupdate = () => { clearBackgroundStallWatchdog('time-progress'); const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); updateMediaPosition(); updateSyncedLyrics(); syncNowPlayingLyrics(); savePlayerState(); };
-  audio.onloadedmetadata = () => { updateTimeDisplay(); updateMediaPosition(); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
+  audio.ontimeupdate = () => { clearBackgroundStallWatchdog('time-progress'); const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); updateMediaPosition(); synchronizeLyricsFromAudio({ reason: 'timeupdate' }); savePlayerState(); };
+  audio.onloadedmetadata = () => { updateTimeDisplay(); updateMediaPosition(); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'loadedmetadata' }); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
   audio.onplay = () => { if (audioGraph?.context?.state === 'suspended') void audioGraph.context.resume().catch(() => {}); syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
   audio.onplaying = () => { clearBackgroundStallWatchdog('playing-event'); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('playing-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); };
   audio.onpause = () => { clearBackgroundStallWatchdog('pause-event'); syncAmbientMotionState(); capturePausedResumeSnapshot('audio-pause-event'); $('#playButton').textContent = '▶'; $('#miniPlay').textContent = '▶'; animatePlaybackControls('paused'); setMediaPlaybackState('paused'); playbackDebug('pause-event'); savePlayerState(true); render(); };
   audio.onended = () => { clearBackgroundStallWatchdog('ended-event'); const track = tracks.find((entry) => entry.id === currentId); playbackDebug('ended-event', { previous: trackDebug(track) }); void advanceAfterEnded(); };
   audio.onerror = () => { clearBackgroundStallWatchdog('error-event'); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('error-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); $('#miniPlayer').classList.remove('loading'); setMediaPlaybackState('paused'); toast("This audio file couldn't be played."); };
+  ['seeking', 'seeked'].forEach((eventName) => audio.addEventListener(eventName, () => { resetLyricRenderState(); synchronizeLyricsFromAudio({ force: true, animate: false, reason: eventName }); }));
   ['waiting', 'stalled', 'suspend', 'emptied', 'abort', 'canplay'].forEach((eventName) => audio.addEventListener(eventName, () => { playbackDebug(`audio-${eventName}`); if (eventName === 'waiting' || eventName === 'stalled') armBackgroundStallWatchdog(eventName); else if (eventName === 'canplay') clearBackgroundStallWatchdog('canplay'); }));
   let miniTouch = null, fullTouchY = null, sheetTouchY = null;
   $('#miniPlayer').addEventListener('touchstart', (event) => { if (event.target.closest('#miniPrevious,#miniPlay,#miniNext')) { miniTouch = null; return; } const touch = event.changedTouches[0]; miniTouch = touch ? { x: touch.clientX, y: touch.clientY, direction: null } : null; }, { passive: true });
@@ -2937,13 +3003,13 @@ function wireUI() {
   $('#lyricsContent').addEventListener('scroll', () => {
     if (lyricsSyncDraft || Date.now() < lyricsAutoScrollUntil) return;
     lyricsManualScrollUntil = Date.now() + 5000; $('#lyricsContent').classList.add('manual-scroll'); $('#lyricsReturnCurrent').classList.remove('hidden');
-    clearTimeout(window.zombieLyricsFollowTimer); window.zombieLyricsFollowTimer = setTimeout(() => { lyricsManualScrollUntil = 0; $('#lyricsContent').classList.remove('manual-scroll'); $('#lyricsReturnCurrent').classList.add('hidden'); lastLyricsIndex = -1; updateSyncedLyrics(); }, 5000);
+    clearTimeout(window.zombieLyricsFollowTimer); window.zombieLyricsFollowTimer = setTimeout(() => { lyricsManualScrollUntil = 0; $('#lyricsContent').classList.remove('manual-scroll'); $('#lyricsReturnCurrent').classList.add('hidden'); lastLyricsIndex = -1; synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'lyrics-auto-follow' }); }, 5000);
   }, { passive: true });
 }
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.5.1').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.5.2').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
