@@ -21,7 +21,7 @@ let activeQueueSource = 'library';
 let repeatMode = 'off';
 let artTarget = null, lyricsTarget = null, visualTarget = null, activeLyricsId = null, lastLyricsIndex = -1, visualLoadToken = 0;
 let lyricsSyncDraft = null, lyricsManualScrollUntil = 0, lyricsAutoScrollUntil = 0;
-let lastNowPlayingLyricIndex = -2, nowPlayingLyricsTrackId = null, lyricsFocusActive = false, visualMinimalActive = false, seekSaveTimer = null;
+let lastNowPlayingLyricIndex = -2, nowPlayingLyricsTrackId = null, lyricsFocusActive = false, visualMinimalActive = false, visualMinimalControlsVisible = false, lyricsFocusAnimationToken = 0, seekSaveTimer = null;
 const LYRICS_PROVIDER = Object.freeze({ name: 'LRCLIB', baseUrl: 'https://lrclib.net/api' });
 const LYRICS_REQUEST_GAP_MS = 420, LYRICS_REQUEST_TIMEOUT_MS = 8500;
 let lyricSearchQueue = [], lyricSearchWorkerRunning = false;
@@ -154,10 +154,10 @@ function setNowPlayingLyricLine(element, track, line) {
   element.onclick = () => seekToSyncedLyric(track, line);
 }
 function resetNowPlayingLyrics(track = null) {
-  nowPlayingLyricsTrackId = track?.id || null; lastNowPlayingLyricIndex = -2;
+  nowPlayingLyricsTrackId = track?.id || null; lastNowPlayingLyricIndex = -2; lyricsFocusAnimationToken += 1;
   $('#npLiveLyrics')?.classList.add('hidden');
   setNowPlayingLyricLine($('#npLiveLyricLine'), null, null);
-  const focus = $('#npLyricsFocusPanel'); if (focus) focus.replaceChildren();
+  const focus = $('#npLyricsFocusPanel'); if (focus) { focus.replaceChildren(); delete focus.dataset.focusTrack; delete focus.dataset.focusCentre; }
 }
 function renderLyricsFocus(track, activeIndex) {
   const panel = $('#npLyricsFocusPanel'); if (!panel) return;
@@ -165,17 +165,36 @@ function renderLyricsFocus(track, activeIndex) {
   panel.classList.remove('hidden');
   const lines = track.syncedLyrics || [];
   if (!lines.length) {
-    panel.innerHTML = `<div class="np-focus-empty"><strong>No synced lyrics yet</strong><span>Find, import, or paste lyrics without leaving Now Playing.</span><div><button data-focus-action="find">Find Lyrics</button><button data-focus-action="add">Add Lyrics</button><button data-focus-action="sync">Sync Lyrics</button></div><button id="exitLyricsFocus" class="np-focus-exit">Done</button></div>`;
-    panel.querySelector('[data-focus-action="find"]').onclick = () => { void openLyricsFinder(track.id); };
-    panel.querySelector('[data-focus-action="add"]').onclick = () => openLyricsEditor(track.id);
-    panel.querySelector('[data-focus-action="sync"]').onclick = () => { activeLyricsId = track.id; openLyrics(track.id); startLyricsSync(); };
+    if (panel.dataset.focusTrack !== track.id || !panel.querySelector('.np-focus-empty')) {
+      panel.dataset.focusTrack = track.id; panel.innerHTML = `<div class="np-focus-empty"><strong>No synced lyrics yet</strong><span>Find, import, or paste lyrics without leaving Now Playing.</span><div><button data-focus-action="find">Find Lyrics</button><button data-focus-action="add">Add Lyrics</button><button data-focus-action="sync">Sync Lyrics</button></div><button id="exitLyricsFocus" class="np-focus-exit">Done</button></div>`;
+      panel.querySelector('[data-focus-action="find"]').onclick = () => { void openLyricsFinder(track.id); };
+      panel.querySelector('[data-focus-action="add"]').onclick = () => openLyricsEditor(track.id);
+      panel.querySelector('[data-focus-action="sync"]').onclick = () => { activeLyricsId = track.id; openLyrics(track.id); startLyricsSync(); };
+      $('#exitLyricsFocus')?.addEventListener('click', () => setLyricsFocusMode(false));
+    }
   } else {
     const centre = activeIndex < 0 ? 0 : activeIndex;
-    const visible = [centre - 1, centre, centre + 1].filter((index) => index >= 0 && index < lines.length);
-    panel.innerHTML = `<div class="np-focus-lines">${visible.map((index) => `<button class="np-focus-line ${index === centre ? 'current' : index < centre ? 'previous' : 'upcoming'}" data-focus-lyric="${index}">${escapeHTML(lines[index].text)}</button>`).join('')}</div><button id="exitLyricsFocus" class="np-focus-exit">Done</button>`;
-    panel.querySelectorAll('[data-focus-lyric]').forEach((button) => { button.onclick = () => seekToSyncedLyric(track, lines[Number(button.dataset.focusLyric)]); });
+    const needsStructure = panel.dataset.focusTrack !== track.id || !panel.querySelector('.np-focus-lines');
+    if (needsStructure) {
+      panel.dataset.focusTrack = track.id;
+      panel.innerHTML = `<div class="np-focus-lines"><button class="np-focus-line previous" data-focus-slot="previous"></button><button class="np-focus-line current" data-focus-slot="current"></button><button class="np-focus-line upcoming" data-focus-slot="upcoming"></button></div><button id="exitLyricsFocus" class="np-focus-exit">Done</button>`;
+      panel.querySelectorAll('[data-focus-slot]').forEach((button) => { button.onclick = () => { const index = Number(button.dataset.focusLyric); const currentTrack = tracks.find((entry) => entry.id === track.id); const currentLine = currentTrack?.syncedLyrics?.[index]; if (Number.isInteger(index) && currentLine) seekToSyncedLyric(currentTrack, currentLine); }; });
+      $('#exitLyricsFocus')?.addEventListener('click', () => setLyricsFocusMode(false));
+    }
+    const slots = { previous: centre - 1, current: centre, upcoming: centre + 1 };
+    Object.entries(slots).forEach(([slot, index]) => {
+      const button = panel.querySelector(`[data-focus-slot="${slot}"]`); if (!button) return;
+      const line = lines[index]; button.classList.toggle('is-empty', !line); button.disabled = !line;
+      button.dataset.focusLyric = line ? String(index) : ''; button.textContent = line ? line.text : '';
+    });
+    const previousCentre = Number(panel.dataset.focusCentre);
+    panel.dataset.focusCentre = String(centre);
+    if (needsStructure || previousCentre !== centre) {
+      const token = ++lyricsFocusAnimationToken; const list = panel.querySelector('.np-focus-lines');
+      list?.classList.remove('lyrics-shifting');
+      requestAnimationFrame(() => { if (token === lyricsFocusAnimationToken && lyricsFocusActive && panel.dataset.focusTrack === track.id) list?.classList.add('lyrics-shifting'); });
+    }
   }
-  $('#exitLyricsFocus')?.addEventListener('click', () => setLyricsFocusMode(false));
 }
 function syncNowPlayingLyrics(track = tracks.find((entry) => entry.id === currentId), force = false) {
   const live = $('#npLiveLyrics'), liveLine = $('#npLiveLyricLine'); if (!live || !liveLine) return;
@@ -194,16 +213,31 @@ function setLyricsFocusMode(enabled) {
   lyricsFocusActive = Boolean(enabled && currentId);
   if (lyricsFocusActive) setVisualMinimalMode(false, true);
   screen.classList.toggle('lyrics-focus-active', lyricsFocusActive);
+  if (!lyricsFocusActive) {
+    lyricsFocusAnimationToken += 1;
+    const panel = $('#npLyricsFocusPanel');
+    if (panel) {
+      panel.classList.add('hidden');
+      panel.replaceChildren();
+      delete panel.dataset.focusTrack;
+      delete panel.dataset.focusCentre;
+    }
+  }
   const button = $('#lyricsFocusButton'); if (button) { button.classList.toggle('active', lyricsFocusActive); button.setAttribute('aria-pressed', String(lyricsFocusActive)); button.textContent = lyricsFocusActive ? '≡ Lyrics On' : '≡ Lyrics Focus'; }
   syncNowPlayingLyrics(tracks.find((entry) => entry.id === currentId), true);
 }
 function setVisualMinimalMode(enabled, fromLyricsFocus = false) {
   const screen = $('#nowPlayingScreen'); if (!screen) return;
-  visualMinimalActive = Boolean(enabled && currentId);
+  visualMinimalActive = Boolean(enabled && currentId); visualMinimalControlsVisible = false;
   if (visualMinimalActive && !fromLyricsFocus) setLyricsFocusMode(false);
-  screen.classList.toggle('visual-minimal', visualMinimalActive);
+  screen.classList.toggle('visual-minimal', visualMinimalActive); screen.classList.remove('visual-controls-revealed');
   const button = $('#npVisualModeToggle'); if (button) { button.classList.toggle('active', visualMinimalActive); button.setAttribute('aria-pressed', String(visualMinimalActive)); button.setAttribute('aria-label', visualMinimalActive ? 'Leave visual mode' : 'Open visual mode'); }
   syncNowPlayingLyrics(tracks.find((entry) => entry.id === currentId), true);
+}
+function toggleVisualMinimalControls() {
+  if (!visualMinimalActive) return;
+  visualMinimalControlsVisible = !visualMinimalControlsVisible;
+  $('#nowPlayingScreen')?.classList.toggle('visual-controls-revealed', visualMinimalControlsVisible);
 }
 function buildDecorativeWaveform() {
   const muted = $('#waveformMuted'), played = $('#waveformPlayed'); if (!muted || !played || muted.childElementCount) return;
@@ -2881,6 +2915,10 @@ function wireUI() {
     const screen = $('#nowPlayingScreen'); screen.style.removeProperty('--dismiss-distance'); screen.classList.remove('dragging');
     if (fullTouchY !== null && distance > 70) closeNowPlaying(); fullTouchY = null;
   }, { passive: true });
+  $('#nowPlayingScreen').addEventListener('click', (event) => {
+    if (!visualMinimalActive || event.target.closest('button,input')) return;
+    toggleVisualMinimalControls();
+  });
   const sheetCard = $('#sheet .sheet-card');
   sheetCard.addEventListener('touchstart', (event) => { sheetTouchY = $('#sheetContent').scrollTop <= 0 && !event.target.closest('button,input') ? event.changedTouches[0]?.clientY ?? null : null; }, { passive: true });
   sheetCard.addEventListener('touchmove', (event) => {
@@ -2905,7 +2943,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.5.0').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.5.1').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
