@@ -126,10 +126,15 @@ async function deriveArtworkPalette(track) {
 }
 function setMarqueeText(selector, value) {
   const element = $(selector); if (!element) return;
-  const copy = document.createElement('span'); copy.textContent = String(value || ''); element.replaceChildren(copy); element.classList.remove('marquee-active'); element.style.removeProperty('--marquee-distance');
+  const copy = document.createElement('span'); copy.textContent = String(value || ''); element.replaceChildren(copy); element.classList.remove('marquee-active'); element.style.removeProperty('--marquee-distance'); element.style.removeProperty('--marquee-duration');
   requestAnimationFrame(() => {
     const distance = Math.max(0, copy.scrollWidth - element.clientWidth);
-    if (distance > 4) { element.style.setProperty('--marquee-distance', `-${distance}px`); element.classList.add('marquee-active'); }
+    if (distance > 4) {
+      // The title moves at a steady, unhurried speed regardless of how long it is.
+      // Short titles never receive the marquee class, so they remain completely still.
+      const seconds = Math.max(13, Math.min(22, 10 + (distance / 18)));
+      element.style.setProperty('--marquee-distance', `-${distance}px`); element.style.setProperty('--marquee-duration', `${seconds.toFixed(1)}s`); element.classList.add('marquee-active');
+    }
   });
 }
 function lyricSyncState(track = tracks.find((entry) => entry.id === currentId)) {
@@ -195,7 +200,10 @@ function renderLyricsFocus(track, activeIndex, { animate = true } = {}) {
     Object.entries(slots).forEach(([slot, index]) => {
       const button = panel.querySelector(`[data-focus-slot="${slot}"]`); if (!button) return;
       const line = lines[index]; button.classList.toggle('is-empty', !line); button.disabled = !line;
-      button.dataset.focusLyric = line ? String(index) : ''; button.textContent = line ? line.text : '';
+      const length = line?.text?.trim().length || 0;
+      button.dataset.focusLyric = line ? String(index) : '';
+      button.dataset.focusSize = !line ? 'empty' : length > 100 ? 'long' : length > 58 ? 'medium' : 'standard';
+      button.textContent = line ? line.text : '';
     });
     const previousCentre = Number(panel.dataset.focusCentre);
     panel.dataset.focusCentre = String(centre);
@@ -394,17 +402,19 @@ function applyPreferences() {
   document.documentElement.dataset.zombieReducedMotion = preferences.reduceAnimations ? 'on' : 'off';
   audio.playbackRate = preferences.playbackRate;
   if ($('#sortSelect')) $('#sortSelect').value = preferences.sort;
-  $('#layoutStatus') && ($('#layoutStatus').textContent = preferences.layout === 'compact' ? 'Compact List' : preferences.layout === 'grid' ? 'Artwork Grid' : 'Shelves');
+  const layoutLabel = preferences.layout === 'compact' ? 'Compact List' : preferences.layout === 'grid' ? 'Artwork Grid' : 'Shelves';
+  $('#layoutStatus') && ($('#layoutStatus').textContent = `Current · ${layoutLabel}`);
+  $('#layoutButton') && ($('#layoutButton').textContent = 'Change');
   $('#libraryCustomizeStatus') && ($('#libraryCustomizeStatus').textContent = `${Object.values(preferences.libraryShelves).filter(Boolean).length} shelf sections shown`);
-  $('#appearanceStatus') && ($('#appearanceStatus').textContent = preferences.appearance === 'pure' ? 'Pure Black' : preferences.appearance === 'ambient' ? 'Artwork Ambient' : 'Soft Black');
-  $('#visualStatus') && ($('#visualStatus').textContent = preferences.visualMode === 'animation' ? 'Animation when a song has one' : 'Artwork by default');
+  $('#appearanceStatus') && ($('#appearanceStatus').textContent = `Current · ${preferences.appearance === 'pure' ? 'Pure Black' : preferences.appearance === 'ambient' ? 'Artwork Ambient' : 'Soft Black'}`);
+  $('#visualStatus') && ($('#visualStatus').textContent = `Current · ${preferences.visualMode === 'animation' ? 'Animation when a song has one' : 'Artwork by default'}`);
   $('#visualButton') && ($('#visualButton').textContent = preferences.visualMode === 'animation' ? '◇ Animation' : '◇ Artwork');
   $('#visualButton')?.classList.toggle('active', preferences.visualMode === 'animation');
-  $('#dynamicColoursStatus') && ($('#dynamicColoursStatus').textContent = preferences.dynamicColours === 'full' ? 'Full artwork colour' : preferences.dynamicColours === 'minimal' ? 'Minimal colour' : preferences.dynamicColours === 'off' ? `Off · ${ZOMBIE_ACCENTS[preferences.zombieAccent] ? preferences.zombieAccent[0].toUpperCase() + preferences.zombieAccent.slice(1) : 'Purple'}` : 'Balanced');
-  $('#colourIntensityStatus') && ($('#colourIntensityStatus').textContent = preferences.colourIntensity[0].toUpperCase() + preferences.colourIntensity.slice(1));
+  $('#dynamicColoursStatus') && ($('#dynamicColoursStatus').textContent = `Current · ${preferences.dynamicColours === 'full' ? 'Full artwork colour' : preferences.dynamicColours === 'minimal' ? 'Minimal colour' : preferences.dynamicColours === 'off' ? `Off · ${ZOMBIE_ACCENTS[preferences.zombieAccent] ? preferences.zombieAccent[0].toUpperCase() + preferences.zombieAccent.slice(1) : 'Purple'}` : 'Balanced'}`);
+  $('#colourIntensityStatus') && ($('#colourIntensityStatus').textContent = `Current · ${preferences.colourIntensity[0].toUpperCase() + preferences.colourIntensity.slice(1)}`);
   $('#visualEffectsStatus') && ($('#visualEffectsStatus').textContent = preferences.visualEffects ? 'On · subtle only' : 'Off');
   $('#reduceAnimationsStatus') && ($('#reduceAnimationsStatus').textContent = preferences.reduceAnimations ? 'On · essential fades stay on' : 'Off · motion is on');
-  $('#lyricsDisplayStatus') && ($('#lyricsDisplayStatus').textContent = preferences.lyricsDisplay === 'focus' ? 'Focus Mode' : preferences.lyricsDisplay === 'off' ? 'Off' : 'Single Line');
+  $('#lyricsDisplayStatus') && ($('#lyricsDisplayStatus').textContent = `Current · ${preferences.lyricsDisplay === 'focus' ? 'Focus Mode' : preferences.lyricsDisplay === 'off' ? 'Off' : 'Single Line'}`);
   updateTimeDisplay();
   applyAmbientPalette();
 }
@@ -1568,7 +1578,7 @@ function renderHomeShelves(area) {
   if (preferences.libraryShelves.nowPlaying) {
     const hero = document.createElement(current ? 'button' : 'article'); hero.className = 'home-hero';
     hero.innerHTML = current
-      ? `<p>NOW PLAYING</p><strong>${escapeHTML(current.title)}</strong><small>${escapeHTML(current.artist)} · ${audio.paused ? 'Ready when you are' : 'Playing from your local library'}</small><span class="hero-now">${current.emoji} <span>Open Now Playing</span></span>`
+      ? `<p>NOW PLAYING</p><strong>${escapeHTML(current.title)}</strong><small>${escapeHTML(current.artist)} · ${audio.paused ? 'Ready when you are' : 'Playing from your local library'}</small><span class="hero-now">${current.emoji} <span>${audio.paused ? 'Ready to play' : 'Playing now'}</span></span>`
       : '<p>YOUR MUSIC. YOUR RULES.</p><strong>Built for your local library.</strong><small>Offline-ready playback, your playlists, your lyrics.</small>';
     if (current) hero.onclick = openNowPlaying;
     area.append(hero);
@@ -3009,7 +3019,7 @@ function wireUI() {
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.5.2').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.5.3').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
