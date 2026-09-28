@@ -20,7 +20,7 @@ let queue = [], queueIndex = -1, shuffleOn = false, shuffleBag = [], shuffleHist
 let activeQueueSource = 'library';
 let repeatMode = 'off';
 let artTarget = null, lyricsTarget = null, visualTarget = null, activeLyricsId = null, lastLyricsIndex = -1, visualLoadToken = 0;
-let lyricsSyncDraft = null, lyricsManualScrollUntil = 0, lyricsAutoScrollUntil = 0;
+let lyricsSyncDraft = null, lyricsManualScrollUntil = 0;
 let lastNowPlayingLyricIndex = -2, nowPlayingLyricsTrackId = null, lyricsFocusActive = false, lyricsFocusDefaultActive = false, visualMinimalActive = false, visualMinimalControlsVisible = false, lyricsFocusAnimationToken = 0, lyricSyncRevision = 0, seekSaveTimer = null;
 const LYRICS_PROVIDER = Object.freeze({ name: 'LRCLIB', baseUrl: 'https://lrclib.net/api' });
 const LYRICS_REQUEST_GAP_MS = 420, LYRICS_REQUEST_TIMEOUT_MS = 8500;
@@ -124,18 +124,33 @@ async function deriveArtworkPalette(track) {
   } catch { /* Artwork colours are optional; the stable local fallback palette remains in use. */ }
   finally { if (imageUrl) URL.revokeObjectURL(imageUrl); paletteJobs.delete(track.id); }
 }
+const marqueeElements = new Set();
+const marqueeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver((entries) => entries.forEach(({ target }) => measureMarquee(target))) : null;
+function measureMarquee(element) {
+  const copy = element?.firstElementChild;
+  if (!copy || !element.clientWidth) return;
+  const distance = Math.max(0, Math.ceil(copy.scrollWidth - element.clientWidth));
+  element.classList.toggle('marquee-active', distance > 1);
+  if (distance > 1) {
+    const seconds = Math.max(13, Math.min(25, 10 + distance / 18));
+    element.style.setProperty('--marquee-distance', `-${distance}px`);
+    element.style.setProperty('--marquee-duration', `${seconds.toFixed(1)}s`);
+  } else {
+    element.style.removeProperty('--marquee-distance');
+    element.style.removeProperty('--marquee-duration');
+  }
+}
+function refreshMarquees() { marqueeElements.forEach((element) => requestAnimationFrame(() => measureMarquee(element))); }
 function setMarqueeText(selector, value) {
   const element = $(selector); if (!element) return;
-  const copy = document.createElement('span'); copy.textContent = String(value || ''); element.replaceChildren(copy); element.classList.remove('marquee-active'); element.style.removeProperty('--marquee-distance'); element.style.removeProperty('--marquee-duration');
-  requestAnimationFrame(() => {
-    const distance = Math.max(0, copy.scrollWidth - element.clientWidth);
-    if (distance > 4) {
-      // The title moves at a steady, unhurried speed regardless of how long it is.
-      // Short titles never receive the marquee class, so they remain completely still.
-      const seconds = Math.max(13, Math.min(22, 10 + (distance / 18)));
-      element.style.setProperty('--marquee-distance', `-${distance}px`); element.style.setProperty('--marquee-duration', `${seconds.toFixed(1)}s`); element.classList.add('marquee-active');
-    }
-  });
+  const content = String(value || '');
+  if (element.firstElementChild?.textContent !== content || element.childElementCount !== 1) {
+    const copy = document.createElement('span'); copy.textContent = content; element.replaceChildren(copy);
+    element.classList.remove('marquee-active');
+  }
+  if (!marqueeElements.has(element)) { marqueeElements.add(element); marqueeObserver?.observe(element); }
+  requestAnimationFrame(() => measureMarquee(element));
+  if (document.fonts?.ready) document.fonts.ready.then(() => measureMarquee(element)).catch(() => {});
 }
 function lyricSyncState(track = tracks.find((entry) => entry.id === currentId)) {
   const currentTrack = track?.id === currentId ? track : tracks.find((entry) => entry.id === currentId);
@@ -159,6 +174,8 @@ function seekToSyncedLyric(track, line) {
   if (!track || !line || !Number.isFinite(Number(line.time))) return;
   const target = Math.max(0, Number(line.time) + lyricOffsetFor(track));
   audio.currentTime = audio.duration ? Math.min(target, Math.max(0, audio.duration - 0.05)) : target;
+  lyricsManualScrollUntil = 0; clearTimeout(window.zombieLyricsFollowTimer);
+  $('#lyricsContent')?.classList.remove('manual-scroll'); $('#lyricsReturnCurrent')?.classList.add('hidden');
   resetLyricRenderState();
   updateTimeDisplay(); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'lyric-tap' }); savePlayerState(true);
 }
@@ -210,6 +227,7 @@ function renderLyricsFocus(track, activeIndex, { animate = true } = {}) {
     if (needsStructure || previousCentre !== centre) {
       const list = panel.querySelector('.np-focus-lines');
       list?.classList.remove('lyrics-shifting');
+      list?.querySelectorAll('.np-focus-line').forEach((line) => line.getAnimations?.().forEach((animation) => animation.cancel()));
       if (!animate) { lyricsFocusAnimationToken += 1; return; }
       const token = ++lyricsFocusAnimationToken;
       requestAnimationFrame(() => { if (token === lyricsFocusAnimationToken && lyricsFocusActive && panel.dataset.focusTrack === track.id) list?.classList.add('lyrics-shifting'); });
@@ -242,13 +260,21 @@ function synchronizeLyricsFromAudio({ force = false, animate = true, reason = 'p
 function setLyricsFocusMode(enabled, { defaultMode = false } = {}) {
   const screen = $('#nowPlayingScreen'); if (!screen) return;
   const track = tracks.find((entry) => entry.id === currentId);
+  lyricsFocusAnimationToken += 1;
+  const panel = $('#npLyricsFocusPanel');
+  panel?.querySelector('.np-focus-lines')?.classList.remove('lyrics-shifting');
+  panel?.querySelectorAll('.np-focus-line').forEach((line) => line.getAnimations?.().forEach((animation) => animation.cancel()));
   lyricsFocusDefaultActive = Boolean(enabled && defaultMode);
   lyricsFocusActive = Boolean(enabled && track && (!defaultMode || track.syncedLyrics?.length));
-  if (lyricsFocusActive) setVisualMinimalMode(false, true);
+  if (lyricsFocusActive && visualMinimalActive) {
+    visualMinimalActive = false; visualMinimalControlsVisible = false;
+    screen.classList.remove('visual-minimal', 'visual-controls-revealed');
+    const visualButton = $('#npVisualModeToggle');
+    visualButton?.classList.remove('active'); visualButton?.setAttribute('aria-pressed', 'false'); visualButton?.setAttribute('aria-label', 'Open visual mode');
+  }
   screen.classList.toggle('lyrics-focus-active', lyricsFocusActive);
+  screen.dataset.lyricPresentation = lyricsFocusActive ? 'focus' : preferences.lyricsDisplay === 'single' ? 'single' : 'off';
   if (!lyricsFocusActive) {
-    lyricsFocusAnimationToken += 1;
-    const panel = $('#npLyricsFocusPanel');
     if (panel) {
       panel.classList.add('hidden');
       panel.replaceChildren();
@@ -258,6 +284,7 @@ function setLyricsFocusMode(enabled, { defaultMode = false } = {}) {
   }
   const button = $('#lyricsFocusButton'); if (button) { button.classList.toggle('active', lyricsFocusActive); button.setAttribute('aria-pressed', String(lyricsFocusActive)); button.textContent = lyricsFocusActive ? '≡ Lyrics On' : '≡ Lyrics Focus'; }
   synchronizeLyricsFromAudio({ force: true, animate: false, reason: lyricsFocusActive ? 'focus-enter' : 'focus-exit' });
+  refreshMarquees();
 }
 function setVisualMinimalMode(enabled, fromLyricsFocus = false) {
   const screen = $('#nowPlayingScreen'); if (!screen) return;
@@ -837,10 +864,10 @@ function updateSyncedLyrics(force = false, state = null) {
   const activeLine = lines[activeIndex]; const content = $('#lyricsContent');
   if (activeLine && content) {
     const lineBox = activeLine.getBoundingClientRect(), contentBox = content.getBoundingClientRect();
-    const target = Math.max(0, content.scrollTop + lineBox.top - contentBox.top - (content.clientHeight * .5));
-    const needsScroll = force || Math.abs(content.scrollTop - target) > Math.max(42, content.clientHeight * .18);
-    if (needsScroll && (force || Date.now() >= lyricsManualScrollUntil)) {
-      lyricsAutoScrollUntil = Date.now() + 650;
+    const target = Math.max(0, Math.min(content.scrollHeight - content.clientHeight,
+      content.scrollTop + lineBox.top + lineBox.height / 2 - contentBox.top - content.clientHeight * .53));
+    const needsScroll = force || Math.abs(content.scrollTop - target) > 8;
+    if (needsScroll && Date.now() >= lyricsManualScrollUntil) {
       content.scrollTo({ top: target, behavior: force || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
     }
   }
@@ -1240,7 +1267,9 @@ function confirmActualPlayback(track, token, reason) {
   $('#miniPlayer').classList.remove('loading'); $('#playButton').textContent = 'Ⅱ'; $('#miniPlay').textContent = 'Ⅱ'; animatePlaybackControls('playing'); setMediaPlaybackState('playing');
   if (activeTrack && countedSerial !== playbackSerial) { countedSerial = playbackSerial; activeTrack.playCount = (activeTrack.playCount || 0) + 1; activeTrack.lastPlayed = Date.now(); saveRecord('tracks', activeTrack).catch(() => {}); }
   releaseRetiredAudioUrls('replacement confirmed');
-  playbackDebug('play-confirmed', { reason, next: trackDebug(activeTrack) }); void updateMediaSession(activeTrack); render(); void prepareNextTrack();
+  playbackDebug('play-confirmed', { reason, next: trackDebug(activeTrack) });
+  armBackgroundStallWatchdog(`play-confirmed:${reason}`);
+  void updateMediaSession(activeTrack); render(); void prepareNextTrack();
   return true;
 }
 async function requestAudioPlay(track, token = loadToken, reason = 'play') {
@@ -1379,7 +1408,11 @@ function runLockScreenPlayAttempt(track, token, position, reason, canRetry) {
   void Promise.resolve(playPromise).then(() => {
     playbackDebug('lock-screen-play-resolved', { next: trackDebug(track), reason, startTime: position });
     if (audio.paused || !currentAudioSource() || audio.error) { fail('play-unconfirmed'); return; }
-    if (!settled) watchdog = window.setTimeout(() => fail('playing-event-timeout'), 650);
+    if (!settled) watchdog = window.setTimeout(() => {
+      const timeAdvanced = audio.currentTime > position + .05;
+      playbackDebug('lock-screen-play-event-timeout-check', { next: trackDebug(track), reason, startTime: position, timeAdvanced });
+      if (timeAdvanced) confirm(); else fail('playing-event-timeout');
+    }, 650);
   }).catch((error) => fail('play-rejected', { playError: { name: error?.name || 'Error', message: error?.message || String(error) } }));
 }
 function retryLockScreenResume(track, token, position, reason) {
@@ -2148,7 +2181,7 @@ function openNowPlaying() {
   clearTimeout(panelTimer); const screen = $('#nowPlayingScreen'), mini = $('#miniPlayer'); screen.classList.remove('hidden', 'closing'); screen.classList.add('from-mini');
   setLyricsFocusMode(preferences.lyricsDisplay === 'focus', { defaultMode: preferences.lyricsDisplay === 'focus' }); setVisualMinimalMode(false); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'now-playing-open' });
   syncModalScrollLock();
-  requestAnimationFrame(() => { setMiniPlayerTransitionOrigin(screen); requestAnimationFrame(() => { mini.classList.add('expanding'); screen.classList.add('presented'); syncNowPlaying(tracks.find((entry) => entry.id === currentId)); void syncNowPlayingVisual(); }); });
+  requestAnimationFrame(() => { setMiniPlayerTransitionOrigin(screen); requestAnimationFrame(() => { mini.classList.add('expanding'); screen.classList.add('presented'); syncNowPlaying(tracks.find((entry) => entry.id === currentId)); refreshMarquees(); void syncNowPlayingVisual(); }); });
 }
 function closeNowPlaying() {
   const screen = $('#nowPlayingScreen'); if (screen.classList.contains('hidden')) return;
@@ -2944,7 +2977,9 @@ function wireUI() {
   $('#visualEffectsButton').onclick = () => { preferences.visualEffects = !preferences.visualEffects; savePreferences(); };
   $('#reduceAnimationsButton').onclick = () => { preferences.reduceAnimations = !preferences.reduceAnimations; savePreferences(); };
   $('#lyricsDisplayButton').onclick = () => {
-    cyclePreference('lyricsDisplay', ['off', 'single', 'focus']);
+    const modes = ['off', 'single', 'focus'];
+    preferences.lyricsDisplay = modes[(modes.indexOf(preferences.lyricsDisplay) + 1) % modes.length];
+    savePreferences(); render();
     if (!$('#nowPlayingScreen').classList.contains('hidden')) setLyricsFocusMode(preferences.lyricsDisplay === 'focus', { defaultMode: preferences.lyricsDisplay === 'focus' });
   };
   $('#exportBackupButton').onclick = () => exportBackup(false); $('#exportFullBackupButton').onclick = () => exportBackup(true); $('#restoreBackupButton').onclick = () => $('#backupInput').click();
@@ -2967,7 +3002,7 @@ function wireUI() {
   $('#syncPreviousButton').onclick = backLyricsSyncLine; $('#syncRedoButton').onclick = redoLyricsSyncLine; $('#syncSaveButton').onclick = () => { void saveLyricsSync(); }; $('#syncCancelButton').onclick = cancelLyricsSync;
   $('#sheetClose').onclick = closeSheet; $('#sheet').onclick = (event) => { if (event.target === $('#sheet')) closeSheet(); };
   const importArea = $('#importArea'); ['dragenter', 'dragover'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.add('dragging'); })); ['dragleave', 'drop'].forEach((type) => importArea.addEventListener(type, (event) => { event.preventDefault(); importArea.classList.remove('dragging'); })); importArea.addEventListener('drop', (event) => importFiles(event.dataTransfer.files));
-  audio.ontimeupdate = () => { clearBackgroundStallWatchdog('time-progress'); const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); updateMediaPosition(); synchronizeLyricsFromAudio({ reason: 'timeupdate' }); savePlayerState(); };
+  audio.ontimeupdate = () => { if (!backgroundStallWatchdog || audio.currentTime > backgroundStallWatchdog.position + .06) clearBackgroundStallWatchdog('time-progress'); const percent = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0; $('#npSeek').value = percent; $('#npSeek').style.setProperty('--seek-progress', `${percent}%`); $('#miniPlayer').style.setProperty('--mini-progress', `${percent}%`); setWaveformProgress(percent); $('#currentTime').textContent = formatTime(audio.currentTime); updateTimeDisplay(); updateMediaPosition(); synchronizeLyricsFromAudio({ reason: 'timeupdate' }); savePlayerState(); };
   audio.onloadedmetadata = () => { updateTimeDisplay(); updateMediaPosition(); synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'loadedmetadata' }); releaseRetiredAudioUrls('new metadata loaded'); playbackDebug('loadedmetadata'); };
   audio.onplay = () => { if (audioGraph?.context?.state === 'suspended') void audioGraph.context.resume().catch(() => {}); syncAmbientMotionState(); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('play-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio), playbackEpoch }); };
   audio.onplaying = () => { clearBackgroundStallWatchdog('playing-event'); const track = tracks.find((entry) => entry.id === pendingAudio?.id || entry.id === currentId); playbackDebug('playing-event', { next: trackDebug(track), pendingSource: Boolean(pendingAudio) }); };
@@ -3010,16 +3045,19 @@ function wireUI() {
   let lyricsTouchY = null;
   $('#lyricsScreen').addEventListener('touchstart', (event) => { lyricsTouchY = event.target.closest('button,.lyrics-content') ? null : event.changedTouches[0]?.clientY ?? null; }, { passive: true });
   $('#lyricsScreen').addEventListener('touchend', (event) => { const endY = event.changedTouches[0]?.clientY; if (lyricsTouchY !== null && Number.isFinite(endY) && endY - lyricsTouchY > 74) closeLyrics(); lyricsTouchY = null; }, { passive: true });
-  $('#lyricsContent').addEventListener('scroll', () => {
-    if (lyricsSyncDraft || Date.now() < lyricsAutoScrollUntil) return;
+  const suspendLyricsFollow = () => {
+    if (lyricsSyncDraft || $('#lyricsScreen').classList.contains('hidden')) return;
     lyricsManualScrollUntil = Date.now() + 5000; $('#lyricsContent').classList.add('manual-scroll'); $('#lyricsReturnCurrent').classList.remove('hidden');
     clearTimeout(window.zombieLyricsFollowTimer); window.zombieLyricsFollowTimer = setTimeout(() => { lyricsManualScrollUntil = 0; $('#lyricsContent').classList.remove('manual-scroll'); $('#lyricsReturnCurrent').classList.add('hidden'); lastLyricsIndex = -1; synchronizeLyricsFromAudio({ force: true, animate: false, reason: 'lyrics-auto-follow' }); }, 5000);
-  }, { passive: true });
+  };
+  $('#lyricsContent').addEventListener('touchmove', suspendLyricsFollow, { passive: true });
+  $('#lyricsContent').addEventListener('wheel', suspendLyricsFollow, { passive: true });
+  $('#lyricsContent').addEventListener('keydown', (event) => { if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End'].includes(event.key)) suspendLyricsFollow(); });
 }
 async function initialise() {
   try {
     installMobileScaleGuard(); await openDatabase(); await loadLibrary(); await restorePlayerState(); await restorePreferences(); await restoreAudioMods(); await restorePendingImport(); wireUI(); $('#volumeControl').value = audio.volume; configureMediaSession(); if (currentId) { const track = tracks.find((entry) => entry.id === currentId); showMiniPlayer(track); $('#currentTime').textContent = formatTime(restoredPosition); updateTimeDisplay(); $('#npSeek').value = track.duration ? Math.min(100, (restoredPosition / track.duration) * 100) : 0; $('#npSeek').style.setProperty('--seek-progress', `${$('#npSeek').value}%`); setWaveformProgress($('#npSeek').value); } syncAmbientMotionState(); render(); updatePlayerMode(); refreshStorageStatus(); schedulePendingImportResume();
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.5.3').catch(() => {});
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js?v=36.5.4').catch(() => {});
   } catch (error) {
     $('#contentArea').innerHTML = `<div class="inline-empty">Zombie could not open local storage. ${escapeHTML(error.message || 'Try closing other Zombie tabs and reopening the app.')}</div>`;
     toast('Local music storage could not be opened');
